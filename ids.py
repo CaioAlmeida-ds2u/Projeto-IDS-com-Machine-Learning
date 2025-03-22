@@ -6,30 +6,34 @@ import signal
 import os
 import json
 import threading
+from filelock import Timeout, FileLock
 
 # --- Variáveis Globais ---
-running = True
+running = True  # Controla a captura, nao o serviço em si
 config_file = "config.json"
-pid_file = "ids_pid.txt"
+pid_file = "ids_pid.txt"  # Ainda usado para o systemd saber o PID
 database_file = "ids.db"
 buffer = []
 buffer_lock = threading.Lock()
 last_write_time = time.time()
-config_lock = threading.Lock()  # Lock para acesso ao config.json
+config_lock = FileLock(f"{config_file}.lock")
 
 # --- Configurações ---
 DATABASE_FILE = "ids.db"
 BUFFER_SIZE_LIMIT = 100
 WRITE_INTERVAL = 5
 INTERFACE = "enp0s3"
-LOG_FILE = "logs/ids.log"
+LOG_FILE = "logs/ids.log"  # Usado pelo systemd também
 
 # --- Função para lidar com sinais (SIGTERM, SIGINT) ---
+#agora o sinal é usado para finalizar todo o serviço
 def signal_handler(signum, frame):
     """Lida com sinais (SIGINT, SIGTERM) para encerrar o IDS."""
     global running
     log_event(f"Sinal {signum} recebido. Encerrando o IDS...")
-    running = False
+    running = False #encerra tudo
+    exit(0)
+
 
 # --- Funções de Decodificação (placeholders) ---
 def unpack_ethernet_header(packet):
@@ -47,28 +51,39 @@ def unpack_udp_header(packet):
 # --- Função para ler a configuração ---
 def read_config():
     """Lê o arquivo de configuração (config.json) e retorna um dicionário."""
-    with config_lock:  # Adiciona lock para evitar condições de corrida
+    with config_lock:
         try:
             with open(config_file, "r") as f:
                 config = json.load(f)
                 return config
         except FileNotFoundError:
             log_event("Arquivo de configuração não encontrado. Criando um novo com valores padrão.")
-            default_config = {"start": False, "blocked_protocols": []}
+            default_config = {"command": ""}  # Começa sem nenhum comando
             try:
                 with open(config_file, "w") as f:
                     json.dump(default_config, f, indent=4)
                 return default_config
-            except Exception as e:
-                log_event(f"Erro ao salvar config: {e}")
+            except:
+                log_event(f"Erro ao salvar config")
                 exit(1)
-
         except json.JSONDecodeError:
             log_event("Erro ao decodificar o arquivo de configuração. Usando configuração padrão.")
-            return {"start": False, "blocked_protocols": []}
+            return {"command": ""}
         except Exception as e:
             log_event(f"Erro ao ler configurações: {e}")
-            return {"start": False, "blocked_protocols": []}
+            return {"command": ""}
+# --- Função para limpar o comando no config.json (NOVO) ---
+def clear_command():
+    """Limpa o campo 'command' no arquivo config.json."""
+    with config_lock:
+        try:
+            with open(config_file, "r") as f:
+                config = json.load(f)
+            config["command"] = ""  # Limpa o comando
+            with open(config_file, "w") as f:
+                json.dump(config, f, indent=4)
+        except Exception as e:
+            log_event(f"Erro ao limpar o comando: {e}")
 
 # --- Funções para Machine Learning (placeholders) ---
 def load_model():
@@ -93,35 +108,34 @@ def log_event(message):
 
 # --- Função de Processamento de Pacotes ---
 def process_packet(packet):
-    """Processa cada pacote capturado."""
-    if hasattr(packet, "haslayer") and (packet.haslayer(scapy.TCP) or packet.haslayer(scapy.UDP)):  # Verifica se é TCP ou UDP
-        log_event(f"Pacote recebido: {packet.summary()}")
+    """Processa cada pacote capturado (placeholder)."""
+    log_event(packet.summary())
 
 # --- Função para verificar se devemos parar (usada pelo stop_filter) ---
 def should_stop_sniffing(packet):
-    """Verifica se a variável 'running' é False (usada como stop_filter)."""
+    """Verifica se a variável 'running' é False."""
     global running
-    return not running
+    return not running  # Agora, só verifica 'running'
 
-# --- Função para iniciar a captura (NOVO) ---
+# --- Função para iniciar a captura (Modificada) ---
 def start_capture():
-    """Inicia a captura de pacotes (precisa ser executada com sudo)."""
+    """Inicia a captura de pacotes."""
     global running
     log_event("Iniciando captura de pacotes...")
     try:
-        while running:
+        while running: #mantem a captura
             try:
                 scapy.sniff(prn=process_packet, store=False, iface=INTERFACE,
-                            stop_filter=should_stop_sniffing, timeout=10)  # Adicionado timeout
+                            stop_filter=should_stop_sniffing)
             except scapy.Scapy_Exception as e:
                 log_event(f"Erro do Scapy: {e}")
-                break  # Sai do loop interno em caso de erro
+                break
             except Exception as e:
                 log_event(f"Erro inesperado: {e}")
-                break  # Sai do loop interno em caso de erro
-
+                break
     except Exception as e:
         log_event(f"Erro no loop de captura: {e}")
+
     finally:
         log_event("Captura finalizada.")
 
@@ -143,23 +157,28 @@ def main():
 
     log_event("IDS iniciado, aguardando comando.")
 
-    try:
-        while running:
-            time.sleep(1)
-    except Exception as e:
-        log_event(f"Erro na espera: {e}")
-    finally:
-        log_event("Encerrando o IDS...")
+    capturing = False  # Variável para controlar se a captura está ativa
+    while True:  # Loop infinito (o serviço roda continuamente)
         try:
-            os.remove(pid_file)
-        except FileNotFoundError:
-            pass
-        log_event("IDS encerrado.")
+            config = read_config()
+            command = config.get("command", "")
+
+            if command == "start" and not capturing:
+                start_capture()  # Inicia a captura
+                capturing = True
+                clear_command()  # Limpa o comando
+            elif command == "stop" and capturing:
+                running = False # Para a captura
+                capturing = False
+                clear_command()
+            elif command == "stop" and not capturing: #caso ja tiver parado
+                clear_command()
+            #Verifica se chegou novo comando ou se o processo não está rodando
+            time.sleep(1)
+
+        except Exception as e:
+            log_event(f"Erro no loop principal: {e}")
 
 # --- Execução do Script ---
 if __name__ == "__main__":
-    config = read_config()
-    if config.get("start", False):  # Usa .get() com valor padrão
-        start_capture()
-    else:
-        main()
+    main()
