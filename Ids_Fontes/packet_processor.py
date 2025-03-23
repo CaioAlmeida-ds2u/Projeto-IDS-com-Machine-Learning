@@ -23,9 +23,12 @@ class PacketCapturer:
             return
 
         self.running = True
-        self.capture_thread = threading.Thread(target=self._capture_loop)
+        self.capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name=f"PacketCapturer-{self.interface}"
+        )
         self.capture_thread.start()
-        logger.info(f"Iniciada captura na interface {self.interface}")
+        logger.info(f"Thread de captura iniciada (ID: {self.capture_thread.native_id})")
 
     def _capture_loop(self):
         """Loop principal de captura"""
@@ -35,12 +38,16 @@ class PacketCapturer:
                 prn=self._handle_packet,
                 store=False,
                 stop_filter=lambda _: not self.running,
-                filter=self.default_filter
+                filter=self.default_filter,
+                timeout=30  # Adicione timeout para evitar bloqueios
             )
+        except scapy.Scapy_Exception as e:
+            logger.error(f"Erro do Scapy: {e}")
         except Exception as e:
-            logger.error(f"Erro na captura: {e}")
+            logger.error(f"Erro geral na captura: {e}")
         finally:
             self.running = False
+            logger.debug("Thread de captura encerrada")
 
     def _handle_packet(self, packet):
         """Processa cada pacote capturado"""
@@ -96,3 +103,11 @@ class PacketCapturer:
         if self.capture_thread:
             self.capture_thread.join(timeout=5)
         logger.info("Captura interrompida")
+
+    def is_alive(self) -> bool:
+        """Verifica se a captura está ativa"""
+        return self.capture_thread.is_alive() if self.capture_thread else False
+
+    def is_capturing(self) -> bool:
+        """Alias para compatibilidade com código existente"""
+        return self.running

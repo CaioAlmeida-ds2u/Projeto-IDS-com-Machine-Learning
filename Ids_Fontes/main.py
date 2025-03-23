@@ -53,9 +53,9 @@ class IDSController:
             time.sleep(1)  # Ajuste o intervalo conforme necessário
 
     def _check_control_commands(self):
-        """Verifica e processa comandos de controle"""
         try:
             with FileLock("config.json.lock", timeout=10):
+                self.config.reload_config()  # Recarrega as configurações do arquivo
                 current_config = self.config.config
                 service_section = current_config.get('service', {})
                 command = service_section.get('requested_command', '').lower()
@@ -209,6 +209,16 @@ class IDSController:
         self.db.connection.close()
         logger.info("Serviço IDS encerrado corretamente")
 
+    def _is_capturer_active(self) -> bool:
+        """Verifica se a captura está ativa"""
+        return self.capturer.is_alive() if self.capturer else False
+
+    def _monitor_components(self):
+        """Monitora o estado dos componentes"""
+        if self._is_capturer_active() and not self.capturer.is_capturing():
+            logger.warning("Capturador parado inesperadamente!")
+            self._update_service_status('error')
+
 if __name__ == "__main__":
     try:
         ids = IDSController()
@@ -216,3 +226,5 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Falha crítica no sistema: {str(e)}")
         raise
+
+

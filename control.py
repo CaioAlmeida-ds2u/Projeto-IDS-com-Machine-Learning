@@ -76,28 +76,29 @@ class ControlService:
             time.sleep(CHECK_INTERVAL)
 
     def _execute_command(self, command: str):
-        """Executa um comando de forma segura"""
         if command not in self.valid_commands:
             self.logger.error(f"Comando inválido: {command}")
             return
-
+    
         try:
             with self.config_lock:
                 config = self._read_config()
-                if config is None:
+                if not config:
+                    self.logger.error("Falha ao ler a configuração.")
                     return
-
+    
+                config.setdefault('service', {})  # Garante que a chave 'service' existe
                 config['service']['requested_command'] = command
-                config['service']['status'] = 'pending'
+                config['service']['status'] = 'pending'  # Define status intermediário
                 
                 if not self._write_config(config):
+                    self.logger.error("Falha ao escrever a configuração.")
                     return
-
-                self.logger.info(f"Comando '{command}' processado")
-        except Timeout:
-            self.logger.error("Timeout ao acessar arquivo de configuração")
+    
+                self.logger.info(f"Comando '{command}' processado com sucesso.")
         except Exception as e:
-            self.logger.error(f"Erro ao executar comando: {e}")
+            self.logger.exception(f"Erro ao executar comando '{command}': {e}")
+
 
     def get_status(self) -> Optional[str]:
         """Obtém o status do serviço"""
