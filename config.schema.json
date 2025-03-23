@@ -1,0 +1,37 @@
+{
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+        "command": {
+            "type": "string",
+            "enum": ["start", "stop", ""]
+        },
+        "status": {
+            "type": "string",
+            "enum": ["running", "stopped", "error", ""]
+        },
+        "settings": {
+            "type": "object",
+            "properties": {
+                "interface": {"type": "string"},
+                "buffer_size": {"type": "integer", "minimum": 10, "maximum": 1000},
+                "write_interval": {"type": "integer", "minimum": 1},
+                "packet_timeout": {"type": "integer", "minimum": 10},
+                "log_level": {"type": "string", "enum": ["DEBUG", "INFO", "WARNING", "ERROR"]}
+            },
+            "required": ["interface"]
+        },
+        "rules": {
+            "type": "object",
+            "properties": {
+                "detect_port_scan": {"type": "boolean"},
+                "detect_ddos": {"type": "boolean"},
+                "whitelist": {
+                    "type": "array",
+                    "items": {"type": "string", "format": "ipv4"}
+                }
+            }
+        }
+    },
+    "required": ["command"]
+}

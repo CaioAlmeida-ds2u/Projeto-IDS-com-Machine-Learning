@@ -1,0 +1,27 @@
+{
+    "service": {
+        "start_command": "systemctl start ids.service",
+        "stop_command": "systemctl stop ids.service",
+        "restart_command": "systemctl restart ids.service",
+        "status": "running",
+        "requested_command": "",
+        "last_modified": "2024-03-16T09:00:00Z"
+    },
+    "database": {
+        "host": "localhost",
+        "port": 3306,
+        "user": "ids_user",
+        "password": "fatec123",
+        "database": "ids_db",
+        "ssl": false,
+        "connect_timeout": 10,
+        "pool_size": 5
+    },
+    "settings": {
+        "interface": "enp0s3",
+        "buffer_size": 100,
+        "write_interval": 5,
+        "packet_timeout": 30,
+        "log_level": "INFO"
+    }
+}
