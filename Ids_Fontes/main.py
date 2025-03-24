@@ -6,10 +6,11 @@ import socket
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.inet6 import IPv6
-from config import ConfigManager  # Corrigido: Importar a classe
+from config import ConfigManager
 from packet_processor import PacketCapturer
 from data_processing import PacketNormalizer
-import json  # Import para lidar com a configuração
+import json
+import pika  # Importa pika
 
 
 logger = logging.getLogger(__name__)
@@ -23,19 +24,50 @@ class IDSController:
         self.buffer = []
         self.buffer_lock = threading.Lock()
         self._load_configuration()
-        logging.basicConfig(level=self.log_level)  # Configura o logging
+        logging.basicConfig(level=self.log_level)
+
+        # Configurações do RabbitMQ
+        self.rabbitmq_host = 'localhost'  # Altere se o RabbitMQ estiver em outra máquina
+        self.rabbitmq_port = 5672         # Porta padrão do RabbitMQ
+        self.rabbitmq_queue = 'pacotes'   # Nome da fila
+        self.rabbitmq_connection = None
+        self.rabbitmq_channel = None
 
     def _load_configuration(self):
         """Carrega configurações de rede."""
         config_data = self.config.get_config()
-        self.host = config_data['settings'].get('service_host', 'localhost') # Corrigi a leitura
-        self.port = int(config_data['settings'].get('service_port', 65432)) # Corrigi a leitura
+        self.host = config_data['settings'].get('service_host', 'localhost')
+        self.port = int(config_data['settings'].get('service_port', 65432))
         self.interface = config_data['settings'].get('interface', 'enp0s3')
-        self.filter_rules = config_data['settings'].get('filter', 'ip') # Carrega o filtro
+        self.filter_rules = config_data['settings'].get('filter', 'ip')
         self.log_level = logging.INFO  # Valor padrão
 
         log_level_str = config_data['settings'].get('log_level', 'INFO').upper()
         self.log_level = getattr(logging, log_level_str, logging.INFO)
+
+    def _connect_to_rabbitmq(self):
+        """Estabelece conexão com o RabbitMQ."""
+        try:
+            self.rabbitmq_connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host=self.rabbitmq_host, port=self.rabbitmq_port)
+            )
+            self.rabbitmq_channel = self.rabbitmq_connection.channel()
+            self.rabbitmq_channel.queue_declare(queue=self.rabbitmq_queue, durable=True)  # Fila durável
+            logger.info(f"Conectado ao RabbitMQ em {self.rabbitmq_host}:{self.rabbitmq_port}, fila: {self.rabbitmq_queue}")
+        except Exception as e:
+            logger.error(f"Erro ao conectar ao RabbitMQ: {e}", exc_info=True)
+            # Trate o erro aqui (por exemplo, tente reconectar, ou pare o serviço)
+
+    def _close_rabbitmq_connection(self):
+        """Fecha a conexão com o RabbitMQ."""
+        try:
+            if self.rabbitmq_channel and self.rabbitmq_channel.is_open:
+                self.rabbitmq_channel.close()
+            if self.rabbitmq_connection and self.rabbitmq_connection.is_open:
+                self.rabbitmq_connection.close()
+            logger.info("Conexão com o RabbitMQ fechada.")
+        except Exception as e:
+            logger.error(f"Erro ao fechar a conexão com o RabbitMQ: {e}", exc_info=True)
 
 
     def start(self):
@@ -43,6 +75,9 @@ class IDSController:
         logger.info("Iniciando IDS...")
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+        # Conecta ao RabbitMQ ao iniciar
+        self._connect_to_rabbitmq()
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -69,17 +104,16 @@ class IDSController:
                 data = conn.recv(1024).decode().strip().lower()
                 logger.info(f"Comando recebido: {data}")
 
-                if data == 'start':
+                if data == 'start' or data == 'iniciar':
                     self._start_capture()
                     conn.sendall(b"Capture started")
-                elif data == 'stop':
+                elif data == 'stop' or data == 'parar':
                     self._stop_capture()
                     conn.sendall(b"Capture stopped")
                 elif data == 'status':
                     conn.sendall(self.service_status.encode())
-                elif data == 'get_config': # Comando para obter a configuração
+                elif data == 'get_config':
                     config_data = self.config.get_config()
-                    # Adiciona a interface e o filtro *explicitamente*
                     config_data['settings']['interface'] = self.interface
                     config_data['settings']['filter'] = self.filter_rules
                     conn.sendall(json.dumps(config_data).encode())
@@ -92,16 +126,15 @@ class IDSController:
     def _start_capture(self):
         """Inicia a captura de pacotes."""
         if not self.capturer or not self.capturer.is_alive():
-            logger.info(f"Iniciando captura na interface: {self.interface} com filtro: {self.filter_rules}") # Log crucial
+            logger.info(f"Iniciando captura na interface: {self.interface} com filtro: {self.filter_rules}")
             self.capturer = PacketCapturer(
                 interface=self.interface,
                 packet_handler=self._process_packet,
-                filter_rules=self.filter_rules  # Usa o filtro carregado
+                filter_rules=self.filter_rules
             )
             self.capturer.start()
             self.service_status = 'running'
             logger.info("Captura iniciada")
-
 
     def _stop_capture(self):
         """Para a captura de pacotes."""
@@ -111,24 +144,33 @@ class IDSController:
             logger.info("Captura encerrada")
 
     def _process_packet(self, packet):
-        """Processa cada pacote capturado."""
+        """Processa cada pacote capturado e envia para o RabbitMQ."""
         try:
-            processed = PacketNormalizer.normalize(packet)  # Simplificado
-            # logger.debug(f"Valor de 'processed': {processed}") # Debug, pode ser removido depois
+            processed = PacketNormalizer.normalize(packet)
             if processed:
-                with self.buffer_lock:
+                with self.buffer_lock:  # Ainda mantém o buffer local (opcional)
                     self.buffer.append(processed)
-                self._log_packet(processed)  # Log detalhado, opcional
+
+                # Envia para o RabbitMQ
+                try:
+                    message = json.dumps(processed)  # Converte o dicionário para JSON
+                    self.rabbitmq_channel.basic_publish(
+                        exchange='',
+                        routing_key=self.rabbitmq_queue,
+                        body=message,
+                        properties=pika.BasicProperties(
+                            delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE  # Mensagens persistentes
+                        ))
+                    logger.debug(f"Mensagem publicada no RabbitMQ: {message[:100]}...") # Log (truncado)
+                except Exception as e:
+                    logger.error(f"Erro ao publicar no RabbitMQ: {e}", exc_info=True)
+
         except Exception as e:
             logger.error(f"Erro no processamento: {e}")
 
-    def _parse_packet(self, packet):
-        """Analisa as camadas do pacote (agora usando PacketNormalizer)."""
-        return PacketNormalizer.normalize(packet) # Usa o PacketNormalizer
 
-
-    def _log_packet(self, packet_info):
-        """Registra informações do pacote (Opcional - Para Debug)."""
+    def _log_packet(self, packet_info):  # Opcional: Mantenha se quiser logs detalhados
+        """Registra informações do pacote (Opcional)."""
         logger.info("***** Pacote Capturado *****")
 
         if 'src_mac' in packet_info:
@@ -151,7 +193,6 @@ class IDSController:
         logger.info("***** Fim do Pacote *****\n")
 
 
-
     def _signal_handler(self, signum, frame):
         """Manipula sinais de desligamento."""
         logger.info(f"Recebido sinal {signum}, encerrando...")
@@ -161,6 +202,7 @@ class IDSController:
         """Para todos os componentes."""
         self.running = False
         self._stop_capture()
+        self._close_rabbitmq_connection() # Fecha a conexão com RabbitMQ
         logger.info("Serviço encerrado")
 
 if __name__ == "__main__":
