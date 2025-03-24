@@ -98,11 +98,13 @@ class PacketCapturer:
         return '-'.join(flag_names)
 
     def stop(self):
-        """Para a captura de pacotes"""
+        """Para a captura de pacotes de forma mais assertiva"""
         self.running = False
         if self.capture_thread:
-            self.capture_thread.join(timeout=5)
-        logger.info("Captura interrompida")
+            self.capture_thread.join(timeout=1)  # Tempo máximo de espera
+            if self.capture_thread.is_alive():
+                logger.warning("Thread de captura não respondeu, finalizando forçadamente")
+        logger.info("Captura interrompida com sucesso")
 
     def is_alive(self) -> bool:
         """Verifica se a captura está ativa"""

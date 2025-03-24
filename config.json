@@ -3,7 +3,7 @@
         "start_command": "systemctl start ids.service",
         "stop_command": "systemctl stop ids.service",
         "restart_command": "systemctl restart ids.service",
-        "status": "running",
+        "status": "stopped",
         "requested_command": "",
         "last_modified": "2024-03-16T09:00:00Z"
     },

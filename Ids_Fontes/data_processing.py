@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 class PacketNormalizer:
     """Classe para normalização e preparação de dados para ML"""
-    
+
     @staticmethod
     def normalize(raw_packet: dict) -> dict:
         """Normaliza os dados do pacote para formato estruturado"""
@@ -23,7 +23,7 @@ class PacketNormalizer:
                 'port_src': raw_packet.get('port_src', 0),
                 'port_dest': raw_packet.get('port_dest', 0)
             }
-            
+
             # Adicionar features básicas para ML
             normalized.update(PacketNormalizer._extract_basic_features(raw_packet))
             return normalized
@@ -44,51 +44,4 @@ class PacketNormalizer:
         }
         return features
 
-class DataProcessor:
-    """Classe para gerenciamento do pipeline de dados"""
-    
-    def __init__(self, db):
-        self.db = db
-        self.buffer = []
-        self.buffer_lock = threading.Lock()
-        self.last_write = time.time()
-        self.write_interval = 5  # Segundos
-        self.buffer_size = 100   # Itens
-
-    def process_packet(self, packet_data: dict):
-        """Adiciona pacote normalizado ao buffer"""
-        normalized = PacketNormalizer.normalize(packet_data)
-        if not normalized:
-            return
-
-        with self.buffer_lock:
-            self.buffer.append(normalized)
-            if self._should_flush():
-                self._flush_buffer()
-
-    def _should_flush(self) -> bool:
-        """Verifica condições para descarregar o buffer"""
-        return (len(self.buffer) >= self.buffer_size or
-                (time.time() - self.last_write) > self.write_interval)
-
-    def _flush_buffer(self):
-        """Descarrega o buffer no banco de dados"""
-        try:
-            with self.buffer_lock:
-                if not self.buffer:
-                    return
-                
-                packets = self.buffer.copy()
-                self.db.bulk_insert_packets(packets)
-                self.buffer.clear()
-                self.last_write = time.time()
-                logger.debug(f"Buffer descarregado: {len(packets)} pacotes")
-        except Exception as e:
-            logger.error(f"Erro ao escrever no banco: {e}")
-            # Re-inserir pacotes no buffer em caso de erro
-            with self.buffer_lock:
-                self.buffer.extend(packets)
-
-    def flush(self):
-        """Força a escrita dos dados remanescentes"""
-        self._flush_buffer()
+# Remoção da classe DataProcessor conforme solicitado
