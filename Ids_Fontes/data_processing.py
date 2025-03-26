@@ -12,9 +12,8 @@ logger = logging.getLogger(__name__)
 
 class PacketNormalizer:
     """Classe para normalização e enriquecimento de dados de pacotes"""
-
     @staticmethod
-    def normalize(packet: Packet) -> Optional[dict]:  # Recebe um objeto Packet
+    def normalize(packet: Packet) -> Optional[dict]:
         """Normaliza e valida os dados do pacote para análise."""
         try:
             result = {
@@ -23,70 +22,14 @@ class PacketNormalizer:
                 'protocols': []
             }
 
-            # --- Ethernet ---
-            if Ether in packet:
-                eth = packet[Ether]
-                result.update({
-                    'src_mac': eth.src,
-                    'dst_mac': eth.dst,
-                    'ether_type': eth.type
-                })
-                result['layers'].append('Ethernet')
-
-            # --- IP ---
-            if IP in packet:
-                ip = packet[IP]
-                result.update({
-                    'src_ip': ip.src,
-                    'dst_ip': ip.dst,
-                    'ip_version': 4,
-                    'ttl': ip.ttl,
-                    'protocol': ip.proto  # Protocolo da camada de transporte
-                })
-                result['layers'].append('IPv4')
-                result['protocols'].append('IP')
-            elif IPv6 in packet:
-                ipv6 = packet[IPv6]
-                result.update({
-                    'src_ip': ipv6.src,
-                    'dst_ip': ipv6.dst,
-                    'ip_version': 6,
-                    'hop_limit': ipv6.hlim,
-                    'protocol': ipv6.nh  # Next Header (similar a ip.proto)
-                })
-                result['layers'].append('IPv6')
-                result['protocols'].append('IP')
-
-
-            # --- Transporte ---
-            if TCP in packet:
-                tcp = packet[TCP]
-                result.update({
-                    'src_port': tcp.sport,
-                    'dst_port': tcp.dport,
-                    'flags': PacketNormalizer._parse_tcp_flags(tcp.flags),
-                    'protocol': 'TCP'  # Sobrescreve o protocolo IP
-                })
-                result['layers'].append('TCP')
-            elif UDP in packet:
-                udp = packet[UDP]
-                result.update({
-                    'src_port': udp.sport,
-                    'dst_port': udp.dport,
-                    'protocol': 'UDP'  # Sobrescreve o protocolo IP
-                })
-                result['layers'].append('UDP')
-            elif ICMP in packet:
-                # ICMP não tem portas
-                result.update({
-                    'protocol': 'ICMP'  # Sobrescreve o protocolo IP
-                })
-                result['layers'].append('ICMP')
+            PacketNormalizer._process_ethernet(packet, result)
+            PacketNormalizer._process_ip(packet, result)
+            PacketNormalizer._process_transport(packet, result)
 
             if 'protocol' not in result:
-                return None  # Não processa se não houver protocolo
-            
-            normalized_result =  {
+                return None
+
+            normalized_result = {
                 'timestamp': datetime.fromtimestamp(result['timestamp']).isoformat(),
                 'src_ip': PacketNormalizer._validate_ip(result.get('src_ip')),
                 'dst_ip': PacketNormalizer._validate_ip(result.get('dst_ip')),
@@ -95,11 +38,11 @@ class PacketNormalizer:
                 'dst_port': result.get('dst_port', 0),
                 'ip_version': result.get('ip_version', 0),
                 'ttl': result.get('ttl', 0),
-                'tcp_flags': result.get('flags', {}),  # Flags TCP
-                # 'payload_size': len(packet.payload) if hasattr(packet, 'payload') else 0, # Adicionado
+                'tcp_flags': result.get('flags', {}),
                 'src_mac': result.get('src_mac'),
                 'dst_mac': result.get('dst_mac')
             }
+
             if not normalized_result['src_ip'] or not normalized_result['dst_ip']:
                 return None
 
@@ -108,6 +51,44 @@ class PacketNormalizer:
         except Exception as e:
             logger.error(f"Erro na normalização: {e}", exc_info=True)
             return None
+        
+        
+    @staticmethod
+    def _process_transport(packet: Packet, result: dict) -> None:
+        """Processa a camada de transporte (TCP, UDP, ICMP)."""
+        if TCP in packet:
+            tcp = packet[TCP]
+            result.update({
+                'src_port': tcp.sport,
+                'dst_port': tcp.dport,
+                'flags': PacketNormalizer._parse_tcp_flags(tcp.flags)
+            })
+            result['layers'].append('TCP')
+            result['protocols'].append('TCP')   
+
+        elif UDP in packet:
+            udp = packet[UDP]
+            result.update({
+                'src_port': udp.sport,
+                'dst_port': udp.dport,
+                'udp_length': len(udp)
+            })
+            result['layers'].append('UDP')
+            result['protocols'].append('UDP')   
+
+        elif ICMP in packet:
+            icmp = packet[ICMP]
+            result.update({
+                'icmp_type': icmp.type,
+                'icmp_code': icmp.code
+            })
+            result['layers'].append('ICMP')
+            result['protocols'].append('ICMP')  
+
+        else:
+            # Caso nenhum protocolo de transporte seja identificado
+            result['protocol'] = 'Unknown'
+            logger.debug("Protocolo de transporte desconhecido no pacote.")
 
     @staticmethod
     def _validate_ip(ip: Optional[str]) -> Optional[str]:
@@ -117,22 +98,28 @@ class PacketNormalizer:
         try:
             return str(ipaddress.ip_address(ip))
         except ValueError:
+            logger.warning(f"IP inválido: {ip}")
             return None
 
     @staticmethod
     def _is_private_network(src_ip: Optional[str], dst_ip: Optional[str]) -> bool:
         """Verifica se pelo menos um IP está em rede privada."""
-        def check_private(ip):
-            if not ip: return False
-            try:
-                return ipaddress.ip_address(ip).is_private
-            except ValueError:
-                return False
-        return check_private(src_ip) or check_private(dst_ip)
+        try:
+            return any(ipaddress.ip_address(ip).is_private for ip in (src_ip, dst_ip) if ip)
+        except ValueError:
+            return False
 
     @staticmethod
     def _parse_tcp_flags(flags: int) -> Dict[str, bool]:
-        """Decodifica flags TCP para dicionário booleano."""
+        """
+        Decodifica flags TCP para um dicionário booleano.
+
+        Args:
+            flags (int): Valor inteiro representando as flags TCP.
+
+        Returns:
+            Dict[str, bool]: Dicionário com as flags TCP como chaves e valores booleanos.
+        """
         return {
             'FIN': bool(flags & 0x01),
             'SYN': bool(flags & 0x02),
@@ -143,16 +130,28 @@ class PacketNormalizer:
         }
     @staticmethod
     def _extract_features(packet: dict) -> dict:
-        """Extrai features para análise de ML."""
+        """
+        Extrai features para análise de Machine Learning.
+
+        Args:
+            packet (dict): Dicionário contendo os dados normalizados do pacote.
+
+        Returns:
+            dict: Dicionário com as features extraídas.
+        """
         return {
-            'is_tcp': int(packet['protocol'] == 'TCP'),
-            'is_udp': int(packet['protocol'] == 'UDP'),
-            'is_icmp': int(packet['protocol'] == 'ICMP'),
-            'flag_syn': int(packet.get('tcp_flags', {}).get('SYN', False)),  # Acesso seguro
-            'flag_ack': int(packet.get('tcp_flags', {}).get('ACK', False)),  # Acesso seguro
-            'flag_fin': int(packet.get('tcp_flags', {}).get('FIN', False)),  # Acesso seguro
-            'port_src_well_known': int(packet.get('src_port', 0) < 1024),  # Acesso seguro
-            'port_dst_well_known': int(packet.get('dst_port', 0) < 1024),   # Acesso seguro
+            'is_tcp': int(packet.get('protocol') == 'TCP'),
+            'is_udp': int(packet.get('protocol') == 'UDP'),
+            'is_icmp': int(packet.get('protocol') == 'ICMP'),
+            'flag_syn': int(packet.get('tcp_flags', {}).get('SYN', False)),
+            'flag_ack': int(packet.get('tcp_flags', {}).get('ACK', False)),
+            'flag_fin': int(packet.get('tcp_flags', {}).get('FIN', False)),
+            'port_src_well_known': int(packet.get('src_port', 0) < 1024),
+            'port_dst_well_known': int(packet.get('dst_port', 0) < 1024),
+            'udp_length': packet.get('udp_length', 0),
+            'payload_size': packet.get('payload_size', 0),
+            'port_dst_is_dns': int(packet.get('dst_port') == 53),
+            'port_dst_is_ntp': int(packet.get('dst_port') == 123),
             'same_network': int(
                 PacketNormalizer._safe_ip_network(packet.get('src_ip'), packet.get('dst_ip'))
             )
@@ -161,9 +160,49 @@ class PacketNormalizer:
     @staticmethod
     def _safe_ip_network(ip1: Optional[str], ip2: Optional[str]) -> bool:
         """Verifica se dois IPs estão na mesma sub-rede /24, lidando com possíveis erros."""
-        if not ip1 or not ip2:
-            return False
         try:
-            return ipaddress.ip_network(ip1 + '/24', strict=False) == ipaddress.ip_network(ip2 + '/24', strict=False)
+            if ip1 and ip2:
+                net1 = ipaddress.ip_network(f"{ip1}/24", strict=False)
+                net2 = ipaddress.ip_network(f"{ip2}/24", strict=False)
+                return net1 == net2
         except ValueError:
-            return False
+            pass
+        return False
+    
+    @staticmethod
+    def _process_ethernet(packet: Packet, result: dict) -> None:
+        """Processa a camada Ethernet."""
+        if Ether in packet:
+            eth = packet[Ether]
+            result.update({
+                'src_mac': eth.src,
+                'dst_mac': eth.dst,
+                'ether_type': eth.type
+            })
+            result['layers'].append('Ethernet')
+
+    @staticmethod
+    def _process_ip(packet: Packet, result: dict) -> None:
+        """Processa a camada IP."""
+        if IP in packet:
+            ip = packet[IP]
+            result.update({
+                'src_ip': ip.src,
+                'dst_ip': ip.dst,
+                'ip_version': 4,
+                'ttl': ip.ttl,
+                'protocol': ip.proto
+            })
+            result['layers'].append('IPv4')
+            result['protocols'].append('IP')
+        elif IPv6 in packet:
+            ipv6 = packet[IPv6]
+            result.update({
+                'src_ip': ipv6.src,
+                'dst_ip': ipv6.dst,
+                'ip_version': 6,
+                'hop_limit': ipv6.hlim,
+                'protocol': ipv6.nh
+            })
+            result['layers'].append('IPv6')
+            result['protocols'].append('IP')
