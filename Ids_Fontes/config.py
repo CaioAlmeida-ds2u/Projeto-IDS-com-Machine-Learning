@@ -1,5 +1,6 @@
 import logging
 import json
+import copy
 from typing import Dict, Any
 import os
 
@@ -56,6 +57,11 @@ class ConfigManager:
                 'service_port': 65432,
                 'udp_flood_threshold': 1000,
                 'udp_ports_to_monitor': [53, 123, 161]
+            },
+            'rabbitmq': {
+                'host': 'localhost',
+                'port': 5672,
+                'queue': 'pacotes_ids'
             }
         }
 
@@ -87,11 +93,17 @@ class ConfigManager:
             raise ValueError("service_port deve estar entre 1 e 65535.")
 
     def get_config(self) -> Dict[str, Any]:
-        """Retorna uma cópia da configuração atual."""
-        return {
-            'service': self._current_config['service'].copy(),
-            'settings': self._current_config['settings'].copy()
-        }
+        """Retorna a configuração atual."""
+        # return {
+        #     'service': self._current_config['service'].copy(),
+        #     'settings': self._current_config['settings'].copy()
+        # }      
+        if self._current_config:
+             return copy.deepcopy(self._current_config)
+        else:
+             # Retorna um dicionário vazio ou lança um erro se _current_config for None
+             logger.warning("Tentativa de obter configuração antes de ser carregada ou após falha.")
+             return {}
 
     def get_service_status(self) -> str:
         """Retorna o status atual do serviço."""

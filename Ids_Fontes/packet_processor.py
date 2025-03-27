@@ -55,7 +55,7 @@ class PacketCapturer:
                 store=False,
                 stop_filter=lambda _: not self.running,
                 filter=self.filter_rules,
-                timeout=60  # Timeout de 60 segundos
+                #timeout=60  Timeout de 60 segundos
             )
         except scapy.Scapy_Exception as e:
             logger.error(f"Erro do Scapy: {e}")
