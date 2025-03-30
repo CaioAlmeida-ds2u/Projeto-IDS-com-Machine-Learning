@@ -1,11 +1,7 @@
 {
-    "service": {
-      "start_command": "systemctl start ids.service",
-      "stop_command": "systemctl stop ids.service",
-      "restart_command": "systemctl restart ids.service",
-      "status": "running",
-      "requested_command": "start",
-      "last_modified": "2024-03-16T09:00:00Z"
+    "blocker_worker": {
+      "check_interval_seconds": 5,
+      "firewall_type": "iptables"
     },
     "database": {
       "host": "localhost",
@@ -17,18 +13,45 @@
       "connect_timeout": 10,
       "pool_size": 5
     },
+    "ml_service": {
+      "anomaly_threshold": -0.15,
+      "model_path": "/caminho/completo/para/seu/modelo_ml.joblib"
+    },
+    "rabbitmq": {
+      "alert_queue": "ids_alert_notification_queue",
+      "host": "localhost",
+      "packet_queue": "ids_packet_analysis_queue",
+      "port": 5672
+    },
+    "redis": {
+      "block_list_key": "ids:blocked_ips",
+      "block_ttl_seconds": 3600,
+      "db": 0,
+      "host": "localhost",
+      "password": null,
+      "port": 6379
+    },
+    "service": {
+      "allowed_actions": [
+        "start",
+        "stop",
+        "status",
+        "get_config",
+        "shutdown"
+      ],
+      "last_modified": "2024-03-16T09:00:00Z",
+      "requested_command": "start",
+      "restart_command": "systemctl restart ids.service",
+      "start_command": "systemctl start ids.service",
+      "status": "running",
+      "stop_command": "systemctl stop ids.service"
+    },
     "settings": {
-      "interface": "enp0s3", 
-      "buffer_size": 100,
-      "write_interval": 5,
-      "packet_timeout": 30,
+      "filter": "ip or ip6",
+      "interface": "enp0s3",
       "log_level": "INFO",
       "service_host": "localhost",
-      "service_port": 65432       
-    },
-    "rabbitmq": {            
-      "host": "localhost",    
-      "port": 5672,           
-      "queue": "pacotes_ids"  
+      "service_port": 65432,
+      "noisy_ports": [137, 138, 139, 1900, 5353]
     }
   }

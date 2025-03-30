@@ -57,6 +57,36 @@ class AlertAPI:
 alert_api = AlertAPI()
 alert_api.connect_to_rabbitmq()
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Endpoint para verificar o status da API e conexão RabbitMQ."""
+    status_data = {"status": "ok", "component": "api_ml_alert"}
+    mq_status = "unknown"
+    try:
+        # Verifica se a conexão e o canal existem e estão abertos
+        if (alert_api.rabbitmq_connection and alert_api.rabbitmq_connection.is_open and
+                alert_api.rabbitmq_channel and alert_api.rabbitmq_channel.is_open):
+            # Tenta um comando leve, como declarar a fila novamente (idempotente)
+            alert_api.rabbitmq_channel.queue_declare(queue=ALERT_QUEUE, durable=True, passive=True) # passive=True não cria, só verifica
+            mq_status = "connected"
+        else:
+            mq_status = "disconnected"
+        status_code = 200
+    except (pika.exceptions.AMQPConnectionError, pika.exceptions.ChannelClosed, AttributeError) as e:
+         logger.warning(f"Health check: Falha na verificação RabbitMQ: {e}")
+         mq_status = "error"
+         status_data["error"] = f"RabbitMQ connection error: {e}"
+         status_code = 503 # Service unavailable (dependência falhou)
+    except Exception as e:
+         logger.error(f"Health check: Erro inesperado: {e}", exc_info=True)
+         status_data["status"] = "error"
+         status_data["error"] = f"Unexpected error: {e}"
+         mq_status = "error"
+         status_code = 500
+
+    status_data["dependencies"] = {"rabbitmq": mq_status}
+    return jsonify(status_data), status_code
+
 @app.route('/alerts', methods=['GET'])
 def get_alerts():
     """

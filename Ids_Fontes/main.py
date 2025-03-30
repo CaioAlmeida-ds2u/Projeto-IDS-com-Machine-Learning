@@ -1,7 +1,6 @@
+# main.py - Aprimorado com Status JSON e Health API Opcional
+
 import logging
-# Use o handler específico do systemd se estiver disponível e for necessário
-# Se não, o logging padrão para stdout/stderr já é capturado pelo journald
-# from systemd.journal import JournalHandler
 import time
 import threading
 import signal
@@ -9,301 +8,413 @@ import socket
 import ipaddress
 import netifaces
 import json
-import pika  # Importa pika
-from scapy.layers.l2 import Ether
-from scapy.layers.inet import IP, TCP, UDP
-from scapy.layers.inet6 import IPv6
+import pika
+import copy
+import os # << Adicionado
+from typing import Optional, Dict, Any # << Ajustado
 
-# Assumindo que essas classes existem nos arquivos correspondentes
-from config import ConfigManager
-from packet_processor import PacketCapturer
-from data_processing import PacketNormalizer
+# Import Flask apenas se a Health API for usada
+try:
+    from flask import Flask, jsonify
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
 
-# --- Configuração Inicial do Logger (antes da configuração via arquivo) ---
-# Este logger inicial pega erros MUITO cedo (antes de ler config.json)
-# Ele será reconfigurado depois em _configure_logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-# ---------------------------------------------------------------------
+# Scapy imports (assumindo que estão corretos)
+# (Pode ser necessário ajustar dependendo da sua instalação Scapy)
+try:
+    from scapy.packet import Packet
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet import IP, TCP, UDP, ICMP
+    from scapy.layers.inet6 import IPv6
+    import scapy.all as scapy # Para get_if_list
+except ImportError as e:
+    print(f"ERRO: Falha ao importar Scapy. Verifique a instalação: {e}")
+    # Saída ou tratamento alternativo se Scapy for essencial
+    exit(1)
+
+# Importações locais do projeto
+try:
+    from config import ConfigManager
+    from packet_processor import PacketCapturer
+    from data_processing import PacketNormalizer
+    from redis_client import RedisClient
+except ImportError as e:
+    print(f"ERRO: Falha ao importar módulos locais (config, packet_processor, etc.): {e}")
+    print("Certifique-se que os arquivos .py estão no mesmo diretório ou no PYTHONPATH.")
+    exit(1)
+
+# Configuração inicial do Logger (será reconfigurado)
+# Usar INFO como padrão inicial pode ser menos verboso antes da config carregar
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s [%(levelname)s] - %(message)s')
+logger = logging.getLogger(__name__) # Logger específico para este módulo
 
 class IDSController:
     def __init__(self):
         """Inicializa o controlador do IDS."""
         logger.info("Inicializando IDSController...")
-        self.config_manager = ConfigManager() # Renomeado para clareza
-        self.capturer = None
-        self.running = True # Controla os loops principais
-        self.service_status = 'initializing'
-        # Removido buffer interno, confiando no RabbitMQ
-        # self.buffer = []
-        # self.buffer_lock = threading.Lock()
+        self.config_manager: Optional[ConfigManager] = None
+        self.capturer: Optional[PacketCapturer] = None
+        self.redis_client: Optional[RedisClient] = None
+        self.rabbitmq_connection: Optional[pika.BlockingConnection] = None
+        self.rabbitmq_channel: Optional[pika.channel.Channel] = None
 
+        self.running = True
+        self.service_status = 'initializing'
+        self.control_server_thread: Optional[threading.Thread] = None
+        self.health_api_thread: Optional[threading.Thread] = None # Para a API de health opcional
+
+        # Configurações de rede e serviço (serão carregadas)
         self.host = 'localhost'
         self.port = 65432
-        self.interface = None
-        self.filter_rules = 'ip'
+        self.interface: Optional[str] = None
+        self.filter_rules = 'ip or ip6' # Filtro padrão mais abrangente
         self.log_level = logging.INFO
+        self.health_api_port = 5005 # Porta padrão para health API opcional
 
+        # Configurações RabbitMQ (serão carregadas)
         self.rabbitmq_host = 'localhost'
         self.rabbitmq_port = 5672
-        self.rabbitmq_queue = 'pacotes_ids' # Nome da fila atualizado
-        self.rabbitmq_connection = None
-        self.rabbitmq_channel = None
+        self.rabbitmq_packet_queue = 'ids_packet_analysis_queue' # Padrão
 
         try:
-            # 1. Carrega configurações primeiro
+            # 1. Carrega ConfigManager
+            self.config_manager = ConfigManager()
+            # 2. Carrega configurações gerais
             self._load_configuration()
-            # 2. Configura o logging com base nas configurações carregadas
+            # 3. Configura o logging com base no nível carregado
             self._configure_logging()
-            # 3. Configura parâmetros do RabbitMQ
-            self._configure_rabbitmq_params() # Renomeado para clareza
+            # 4. Carrega parâmetros específicos do RabbitMQ
+            self._configure_rabbitmq_params()
+            # 5. Inicializa o cliente Redis
+            self._initialize_redis_client()
 
-            self.service_status = 'stopped' # Pronto para iniciar
+            self.service_status = 'stopped' # Pronto para receber comandos
+            self.config_manager.set_service_status(self.service_status) # Salva estado inicial
             logger.info("IDSController inicializado com sucesso.")
 
         except Exception as e:
             logger.critical(f"Falha crítica durante a inicialização do IDSController: {e}", exc_info=True)
             self.service_status = 'error'
-            self.running = False # Impede a execução de start()
+            self.running = False
+            # Tenta salvar o status de erro se o config manager foi carregado
+            if self.config_manager:
+                try: self.config_manager.set_service_status(self.service_status)
+                except: pass # Ignora erro ao salvar status de erro
+            self._cleanup() # Tenta limpar recursos mesmo em falha de inicialização
             raise RuntimeError("Falha na inicialização do IDSController") from e
 
     def _load_configuration(self):
-        """Carrega configurações do arquivo usando ConfigManager."""
-        logger.info("Carregando configurações do arquivo...")
+        """Carrega configurações GERAIS do arquivo usando ConfigManager."""
+        if not self.config_manager: raise RuntimeError("ConfigManager não inicializado.")
+        logger.info("Carregando configurações gerais...")
         try:
             config_data = self.config_manager.get_config()
-            if not config_data:
-                 raise ValueError("Arquivo de configuração vazio ou inválido.")
+            if not config_data or 'settings' not in config_data:
+                raise ValueError("Configuração inválida ou seção 'settings' ausente.")
 
-            settings = config_data.get('settings', {})
+            settings = config_data['settings']
             self.host = settings.get('service_host', self.host)
             self.port = int(settings.get('service_port', self.port))
-            self.interface = settings.get('interface', None) # Pode ser None inicialmente
+            self.interface = settings.get('interface', None)
             self.filter_rules = settings.get('filter', self.filter_rules)
-
             log_level_str = settings.get('log_level', 'INFO').upper()
             self.log_level = getattr(logging, log_level_str, logging.INFO)
+            # Porta para API de Health (opcional, pode não estar no config)
+            self.health_api_port = int(settings.get('health_api_port', self.health_api_port))
 
-            # Tenta detectar interface se não estiver definida
+            # Lógica de detecção/validação de interface
+            available_interfaces = netifaces.interfaces()
             if not self.interface:
-                logger.warning("Interface de rede não especificada. Tentando detectar automaticamente...")
-                try:
-                    # Tenta obter o gateway padrão para AF_INET
-                    gateways = netifaces.gateways()
-                    default_gw_info = gateways.get('default', {}).get(netifaces.AF_INET)
-                    if default_gw_info:
-                        self.interface = default_gw_info[1]
-                        logger.info(f"Interface detectada automaticamente: {self.interface}")
-                    else:
-                        # Fallback: Tenta pegar a primeira interface não-loopback (mais arriscado)
-                        interfaces = netifaces.interfaces()
-                        for iface in interfaces:
-                            if iface != 'lo':
-                                addrs = netifaces.ifaddresses(iface)
-                                if netifaces.AF_INET in addrs:
-                                     self.interface = iface
-                                     logger.warning(f"Gateway padrão não encontrado, usando interface fallback: {self.interface}")
-                                     break
-                        if not self.interface:
-                             raise ValueError("Não foi possível detectar interface padrão e nenhuma interface fallback encontrada.")
+                logger.warning("Interface de rede não especificada na config. Tentando detectar...")
+                # Lógica simples: pegar a primeira interface não-loopback
+                non_loopback = [iface for iface in available_interfaces if iface != 'lo']
+                if non_loopback:
+                    self.interface = non_loopback[0]
+                    logger.info(f"Interface detectada automaticamente: {self.interface}")
+                else:
+                     # Tenta usar 'lo' como último recurso se SÓ ela existir
+                     if 'lo' in available_interfaces:
+                         self.interface = 'lo'
+                         logger.warning("Nenhuma interface não-loopback encontrada. Usando 'lo'.")
+                     else:
+                         raise ValueError("Nenhuma interface de rede encontrada no sistema.")
+            elif self.interface not in available_interfaces:
+                raise ValueError(f"Interface de rede '{self.interface}' configurada não existe no sistema. Disponíveis: {available_interfaces}")
 
-                except Exception as e:
-                    logger.error(f"Falha ao detectar interface padrão: {e}. Defina 'interface' no config.json.")
-                    # Erro fatal se a interface for essencial e não puder ser determinada
-                    raise ValueError("Interface de rede não configurada e não pôde ser detectada.") from e
+            logger.info(f"Configurações carregadas: Interface='{self.interface}', Filtro='{self.filter_rules}', LogLevel='{log_level_str}', SocketControle='{self.host}:{self.port}', HealthPort='{self.health_api_port}'")
 
-            # Verifica se a interface final é válida (existe no sistema)
-            if self.interface not in netifaces.interfaces():
-                 raise ValueError(f"Interface de rede '{self.interface}' configurada não existe no sistema.")
-
-            logger.info("Configurações carregadas e validadas com sucesso.")
-            logger.info(f"Interface ativa: {self.interface}")
-            logger.info(f"Filtro de captura: {self.filter_rules}")
-            logger.info(f"Nível de log: {logging.getLevelName(self.log_level)}")
-
+        except (ValueError, KeyError, TypeError) as e:
+            logger.critical(f"Erro ao carregar/validar config 'settings': {e}", exc_info=True)
+            raise RuntimeError("Falha ao carregar/validar configurações 'settings'.") from e
         except Exception as e:
-            logger.critical(f"Erro crítico ao carregar ou validar configuração: {e}", exc_info=True)
-            raise RuntimeError("Falha ao carregar/validar configuração inicial.") from e
+             logger.critical(f"Erro inesperado ao carregar config 'settings': {e}", exc_info=True)
+             raise RuntimeError("Erro inesperado ao carregar 'settings'.") from e
 
     def _configure_logging(self):
-        """Configura o sistema de logging para usar o nível definido (Abordagem Simplificada)."""
+        """Configura o sistema de logging globalmente com o nível definido."""
         try:
-            root_logger = logging.getLogger() # Obtem o logger raiz
-
-            # Remove QUALQUER handler existente do logger raiz (limpeza inicial)
-            # Isso garante que handlers do basicConfig ou de chamadas anteriores sejam removidos.
+            root_logger = logging.getLogger()
             for handler in root_logger.handlers[:]:
                 root_logger.removeHandler(handler)
-
-            # Configura o formato da mensagem
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-            # Cria UM handler para escrever em stderr (capturado pelo journald)
-            stream_handler = logging.StreamHandler() # Por padrão, usa sys.stderr
+            formatter = logging.Formatter('%(asctime)s - %(name)s [%(levelname)s] - %(message)s')
+            stream_handler = logging.StreamHandler()
             stream_handler.setFormatter(formatter)
-
-            # Adiciona o handler APENAS ao logger raiz
             root_logger.addHandler(stream_handler)
-
-            # Define o nível desejado APENAS no logger raiz
             root_logger.setLevel(self.log_level)
-
-            # Loggers específicos (como o 'logger' = getLogger(__name__)) herdarão
-            # o nível e usarão o handler do root automaticamente via propagação.
-            # Não precisamos configurar 'logger' diretamente nem mexer em 'propagate'.
-
-            # Usar 'logger' (que é getLogger(__name__)) para a mensagem de confirmação
-            logger.info(f"Sistema de logging (simplificado) configurado para nível: {logging.getLevelName(root_logger.getEffectiveLevel())}")
-            logger.debug("Mensagem de debug de teste do logging (simplificado).")
-
+            # Log inicial com o nível configurado
+            logger.log(self.log_level, f"Sistema de logging configurado para nível: {logging.getLevelName(root_logger.getEffectiveLevel())}")
         except Exception as e:
-            # Se o logging falhar, loga no stderr e continua
-            print(f"CRITICAL: Falha ao configurar o logging : {e}")
-            logger.critical(f"Falha ao configurar o logging : {e}", exc_info=True) # Tenta logar mesmo assim
+            print(f"CRITICAL: Falha ao configurar o logging: {e}")
+            logger.critical(f"Falha ao configurar o logging: {e}", exc_info=True)
 
     def _configure_rabbitmq_params(self):
-        """Carrega os parâmetros do RabbitMQ da configuração."""
+        """Carrega os parâmetros específicos do RabbitMQ da configuração."""
+        if not self.config_manager: raise RuntimeError("ConfigManager não inicializado.")
         logger.info("Carregando configuração do RabbitMQ...")
         try:
-            config_data = self.config_manager.get_config()
-            rabbitmq_config = config_data.get('rabbitmq') # Não precisa de default {}, verifica abaixo
-
-            if not rabbitmq_config or not isinstance(rabbitmq_config, dict):
-                raise ValueError("Seção 'rabbitmq' não encontrada ou inválida no config.json.")
+            rabbitmq_config = self.config_manager.get_rabbitmq_config()
+            if not rabbitmq_config:
+                raise ValueError("Seção 'rabbitmq' não encontrada ou inválida na configuração.")
 
             self.rabbitmq_host = rabbitmq_config.get('host', self.rabbitmq_host)
             self.rabbitmq_port = int(rabbitmq_config.get('port', self.rabbitmq_port))
-            self.rabbitmq_queue = rabbitmq_config.get('queue', self.rabbitmq_queue)
+            self.rabbitmq_packet_queue = rabbitmq_config.get('packet_queue', self.rabbitmq_packet_queue)
 
-            if not self.rabbitmq_queue:
-                 raise ValueError("Nome da fila ('queue') do RabbitMQ não pode ser vazio.")
+            if not self.rabbitmq_packet_queue:
+                raise ValueError("Nome da fila de pacotes ('packet_queue') do RabbitMQ não pode ser vazio.")
 
-            logger.info(f"Configuração do RabbitMQ carregada: host={self.rabbitmq_host}, port={self.rabbitmq_port}, queue={self.rabbitmq_queue}")
+            logger.info(f"Config RabbitMQ: {self.rabbitmq_host}:{self.rabbitmq_port}, Packet Queue='{self.rabbitmq_packet_queue}'")
 
-        except ValueError as e:
-             logger.critical(f"Erro na configuração do RabbitMQ: {e}", exc_info=True)
-             raise RuntimeError("Configuração inválida para RabbitMQ.") from e
+        except (ValueError, KeyError, TypeError) as e:
+            logger.critical(f"Erro na configuração do RabbitMQ: {e}")
+            raise RuntimeError("Configuração inválida para RabbitMQ.") from e
         except Exception as e:
-            logger.critical(f"Erro inesperado ao carregar configuração RabbitMQ: {e}", exc_info=True)
+            logger.critical(f"Erro inesperado ao carregar config RabbitMQ: {e}", exc_info=True)
             raise RuntimeError("Erro ao carregar configuração RabbitMQ.") from e
 
-    def _connect_to_rabbitmq(self, retries=5, delay=5):
-        """Estabelece conexão com o RabbitMQ com tentativas de reconexão."""
+    def _initialize_redis_client(self):
+        """Inicializa o cliente Redis com base na configuração."""
+        if not self.config_manager: raise RuntimeError("ConfigManager não inicializado.")
+        logger.info("Inicializando cliente Redis...")
+        try:
+            redis_config = self.config_manager.get_redis_config()
+            if not redis_config:
+                raise ValueError("Seção 'redis' não encontrada na configuração.")
+
+            self.redis_client = RedisClient(
+                host=redis_config.get('host', 'localhost'),
+                port=int(redis_config.get('port', 6379)),
+                db=int(redis_config.get('db', 0)),
+                password=redis_config.get('password'),
+                block_list_key=redis_config.get('block_list_key', 'ids:blocked_ips'),
+                # Não passamos block_ttl_seconds aqui, pois este módulo só consulta
+            )
+            # Tentativa de conexão inicial e verificação
+            if not self.redis_client.get_connection():
+                # O RedisClient já loga o erro, apenas levantamos exceção aqui
+                raise ConnectionError("Falha ao conectar ao Redis na inicialização.")
+
+            logger.info("Cliente Redis inicializado e conectado com sucesso.")
+        except (ValueError, KeyError, TypeError) as e:
+            logger.critical(f"Erro na configuração do Redis: {e}")
+            self.redis_client = None
+            raise RuntimeError("Configuração inválida para Redis.") from e
+        except (ConnectionError, redis.exceptions.ConnectionError, redis.exceptions.TimeoutError) as e:
+            logger.critical(f"Falha ao conectar ao Redis na inicialização: {e}")
+            self.redis_client = None
+            raise RuntimeError("Falha na conexão inicial com Redis.") from e
+        except Exception as e:
+            logger.critical(f"Erro inesperado ao inicializar cliente Redis: {e}", exc_info=True)
+            self.redis_client = None
+            raise RuntimeError("Erro ao inicializar Redis.") from e
+
+    def _connect_to_rabbitmq(self, retries=5, delay=5) -> bool:
+        """Estabelece conexão com o RabbitMQ com tentativas."""
         if self.rabbitmq_channel and self.rabbitmq_channel.is_open:
-             logger.debug("Já conectado ao RabbitMQ.")
-             return True
+            return True
 
         logger.info(f"Tentando conectar ao RabbitMQ em {self.rabbitmq_host}:{self.rabbitmq_port}...")
         for attempt in range(retries):
             try:
-                # Fecha conexão anterior se existir e estiver fechada/quebrada
-                self._close_rabbitmq_connection()
+                self._close_rabbitmq_connection() # Garante limpeza antes de tentar
 
-                self.rabbitmq_connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(
-                        host=self.rabbitmq_host,
-                        port=self.rabbitmq_port,
-                        heartbeat=600, # Timeout maior para evitar desconexões
-                        blocked_connection_timeout=300
-                    )
+                # Define parâmetros de conexão
+                params = pika.ConnectionParameters(
+                    host=self.rabbitmq_host,
+                    port=self.rabbitmq_port,
+                    heartbeat=600,
+                    blocked_connection_timeout=300
+                    # Adicionar credenciais se necessário:
+                    # credentials=pika.PlainCredentials('user', 'password')
                 )
+                self.rabbitmq_connection = pika.BlockingConnection(params)
                 self.rabbitmq_channel = self.rabbitmq_connection.channel()
-                # Declara a fila como durável para persistência
-                self.rabbitmq_channel.queue_declare(queue=self.rabbitmq_queue, durable=True)
-                logger.info(f"Conectado ao RabbitMQ. Fila '{self.rabbitmq_queue}' declarada/verificada.")
-                return True # Conectado com sucesso
+
+                # Declara a fila de PACOTES que este módulo PUBLICA
+                # durable=True garante que a fila sobreviva a reinícios do broker
+                self.rabbitmq_channel.queue_declare(queue=self.rabbitmq_packet_queue, durable=True)
+                logger.info(f"Conectado ao RabbitMQ. Fila '{self.rabbitmq_packet_queue}' declarada/verificada.")
+                return True # Sucesso
 
             except pika.exceptions.AMQPConnectionError as e:
-                logger.error(f"Erro de conexão AMQP com RabbitMQ (tentativa {attempt + 1}/{retries}): {e}")
+                error_msg = f"Falha na conexão RabbitMQ (tentativa {attempt + 1}/{retries}): {e}"
+                # Log mais severo na última tentativa
+                if attempt == retries - 1: logger.critical(error_msg)
+                else: logger.warning(error_msg)
             except Exception as e:
-                logger.error(f"Erro inesperado ao conectar/declarar fila no RabbitMQ (tentativa {attempt + 1}/{retries}): {e}", exc_info=False) # exc_info=False para não poluir
+                error_msg = f"Erro inesperado ao conectar RabbitMQ (tentativa {attempt + 1}/{retries}): {e.__class__.__name__} - {e}"
+                if attempt == retries - 1: logger.critical(error_msg, exc_info=True)
+                else: logger.warning(error_msg)
 
             if attempt < retries - 1:
-                logger.info(f"Tentando novamente em {delay} segundos...")
+                logger.info(f"Nova tentativa de conexão RabbitMQ em {delay} segundos...")
                 time.sleep(delay)
-            else:
-                logger.critical("Falha ao conectar ao RabbitMQ após várias tentativas.")
-                # Decide se deve parar o serviço ou apenas continuar sem RabbitMQ
-                # self.stop() # Descomente se RabbitMQ for absolutamente essencial
-                return False # Falha ao conectar
+
+        logger.critical("Falha ao conectar ao RabbitMQ após várias tentativas.")
+        return False # Falha definitiva
 
     def _close_rabbitmq_connection(self):
-        """Fecha a conexão com o RabbitMQ de forma segura."""
-        # logger.debug("Tentando fechar conexão com o RabbitMQ...") # Log muito verboso
-        closed = False
-        try:
-            if self.rabbitmq_channel and self.rabbitmq_channel.is_open:
+        """Fecha a conexão RabbitMQ de forma segura."""
+        # Fecha o canal primeiro
+        if self.rabbitmq_channel and self.rabbitmq_channel.is_open:
+            try:
                 self.rabbitmq_channel.close()
-                logger.info("Canal RabbitMQ fechado.")
-                closed = True
-            if self.rabbitmq_connection and self.rabbitmq_connection.is_open:
+                logger.debug("Canal RabbitMQ fechado.")
+            except Exception as e:
+                # Não crítico, apenas log
+                logger.warning(f"Erro (ignorado) ao fechar canal RabbitMQ: {e}", exc_info=False)
+        # Fecha a conexão
+        if self.rabbitmq_connection and self.rabbitmq_connection.is_open:
+            try:
                 self.rabbitmq_connection.close()
                 logger.info("Conexão RabbitMQ fechada.")
-                closed = True
-        except Exception as e:
-            logger.error(f"Erro ao fechar a conexão com o RabbitMQ: {e}", exc_info=True)
-        finally:
-             self.rabbitmq_channel = None
-             self.rabbitmq_connection = None
-             # if closed: logger.debug("Recursos RabbitMQ liberados.")
+            except Exception as e:
+                logger.warning(f"Erro (ignorado) ao fechar conexão RabbitMQ: {e}", exc_info=False)
+        # Zera as variáveis
+        self.rabbitmq_channel = None
+        self.rabbitmq_connection = None
 
+    # --- API de Health Opcional ---
+    def _start_health_api(self):
+        """(OPCIONAL) Inicia uma API Flask mínima para health check em uma thread."""
+        if not FLASK_AVAILABLE:
+            logger.warning("Flask não está instalado. API de Health não será iniciada.")
+            return
+
+        health_app = Flask(f"{__name__}_health")
+
+        # Desabilita logs padrão do Flask/Werkzeug para evitar poluição
+        log = logging.getLogger('werkzeug')
+        log.setLevel(logging.ERROR)
+        health_app.logger.disabled = True
+
+        @health_app.route('/health', methods=['GET'])
+        def main_health():
+            # Verifica apenas se o loop principal do controlador está ativo
+            if self.running:
+                # Poderia adicionar mais verificações aqui se necessário (ex: capturer.is_alive())
+                return jsonify({"status": "ok", "component": "IDSController", "main_loop": "running"}), 200
+            else:
+                return jsonify({"status": "error", "component": "IDSController", "main_loop": "stopped"}), 503
+
+        def run_flask():
+            try:
+                logger.info(f"Iniciando health API para IDSController em 0.0.0.0:{self.health_api_port}")
+                health_app.run(host='0.0.0.0', port=self.health_api_port, debug=False, use_reloader=False)
+            except OSError as e:
+                 logger.critical(f"Falha ao iniciar health API na porta {self.health_api_port}: {e}. Verifique se a porta está em uso.", exc_info=True)
+                 # Não para o serviço principal por causa disso, mas loga criticamente
+            except Exception as e:
+                logger.error(f"Erro inesperado na thread da health API: {e}", exc_info=True)
+
+        self.health_api_thread = threading.Thread(target=run_flask, name="HealthApiThread", daemon=True)
+        self.health_api_thread.start()
 
     def start(self):
-        """Inicia o serviço principal do IDS e o servidor de controle."""
+        """Inicia o serviço principal do IDS e os servidores auxiliares."""
         if not self.running:
-             logger.error("Não é possível iniciar, o controlador já foi parado ou falhou na inicialização.")
-             return
+            logger.error("Não é possível iniciar, o controlador já foi parado ou falhou na inicialização.")
+            return
 
         logger.info("Iniciando Controlador IDS...")
         self.service_status = 'starting'
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        self.config_manager.set_service_status(self.service_status)
 
-        # Tenta conectar ao RabbitMQ ao iniciar
+        # Configura handlers de sinal
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        except ValueError as e: # Pode acontecer no Windows ou em threads não principais
+            logger.warning(f"Não foi possível configurar signal handlers: {e}. Desligamento gracioso por sinal pode não funcionar.")
+
+        # Verifica conexões essenciais ANTES de iniciar threads
         if not self._connect_to_rabbitmq():
-            logger.critical("Não foi possível conectar ao RabbitMQ no início. Verifique a configuração e o servidor RabbitMQ.")
-            # Decide se o serviço pode rodar sem RabbitMQ
-            # Se não puder, descomente a linha abaixo:
-            # self.stop()
-            # return # Retorna se RabbitMQ for essencial
+            logger.critical("Falha ao conectar ao RabbitMQ no início. Serviço não pode continuar.")
+            self._handle_critical_error("RabbitMQ connection failed")
+            return # Impede a continuação
+
+        if not self.redis_client or not self.redis_client.get_connection():
+            logger.critical("Falha ao conectar ao Redis no início. Serviço não pode continuar.")
+            self._handle_critical_error("Redis connection failed")
+            return # Impede a continuação
 
         # Inicia o servidor de controle em uma thread separada
-        # É importante que a thread de controle possa parar graciosamente
-        control_thread = threading.Thread(target=self._start_control_server, name="ControlServerThread", daemon=True)
-        control_thread.start()
+        self.control_server_thread = threading.Thread(target=self._start_control_server, name="ControlServerThread", daemon=True)
+        self.control_server_thread.start()
 
-        # Mantem a thread principal ativa e verificando o status
-        logger.info("Controlador IDS pronto. Servidor de controle iniciado.")
-        # O status só vai para 'running' quando a captura iniciar
-        if self.service_status != 'error': # Se não houve erro até aqui
-            self.service_status = 'stopped' # Status inicial é parado (sem captura ativa)
+        # Inicia a API de health opcional
+        self._start_health_api()
 
+        logger.info("Controlador IDS pronto. Servidores auxiliares iniciados.")
+        # Define como parado, esperando comando 'start' da API de controle para iniciar captura
+        self.service_status = 'stopped'
+        self.config_manager.set_service_status(self.service_status)
+
+        # Loop principal aguardando sinal de parada
         while self.running:
             try:
-                # Verifica se a thread de controle ainda está viva (opcional)
-                # if not control_thread.is_alive():
-                #     logger.error("Thread do servidor de controle terminou inesperadamente.")
-                #     self.stop()
-                #     break
-                time.sleep(1) # Loop principal pode fazer verificações periódicas
+                # Verifica se a thread de controle ainda está ativa
+                if self.control_server_thread and not self.control_server_thread.is_alive():
+                    logger.error("Thread do servidor de controle terminou inesperadamente! Parando o serviço.")
+                    self._handle_critical_error("Control server thread died")
+                    break # Sai do loop
+
+                # Outras verificações periódicas podem ser adicionadas aqui
+                # Ex: if time.monotonic() % 60 < 1: self._check_dependencies()
+
+                time.sleep(1) # Pausa principal do loop
+
             except Exception as e:
-                 logger.error(f"Erro no loop principal do controlador: {e}", exc_info=True)
-                 self.stop() # Parar em caso de erro inesperado no loop
+                logger.error(f"Erro inesperado no loop principal do controlador: {e}", exc_info=True)
+                self._handle_critical_error(f"Unexpected main loop error: {e}")
+                break # Sai do loop em erro grave
 
         logger.info("Loop principal do controlador encerrado.")
-        # Garante que a limpeza final ocorra se sair do loop por outras razões
-        self._cleanup()
+        self._cleanup() # Garante limpeza ao sair do loop
 
+    def _handle_critical_error(self, reason: str):
+        """Centraliza o tratamento de erros que devem parar o serviço."""
+        logger.critical(f"Erro crítico detectado: {reason}. Solicitando parada do serviço.")
+        self.service_status = 'error'
+        if self.config_manager:
+            try: self.config_manager.set_service_status(self.service_status)
+            except: pass
+        self.running = False # Sinaliza para parar tudo
 
     def _start_control_server(self):
         """Inicia o servidor socket para receber comandos."""
-        server_socket = None
+        server_socket: Optional[socket.socket] = None
         try:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+            if not (1 <= self.port <= 65535):
+                raise ValueError(f"Porta de controle inválida: {self.port}")
+
             server_socket.bind((self.host, self.port))
             server_socket.listen(5)
-            # Define um timeout para o listen/accept não bloquear indefinidamente
+            # Define um timeout para accept() para que o loop possa verificar self.running
             server_socket.settimeout(2.0)
             logger.info(f"Servidor de controle ouvindo em {self.host}:{self.port}")
 
@@ -311,361 +422,430 @@ class IDSController:
                 conn = None
                 addr = None
                 try:
-                    try:
-                        conn, addr = server_socket.accept()
-                        # logger.debug(f"Conexão de controle recebida de {addr}")
-                        # Define timeout para a comunicação com o cliente
-                        conn.settimeout(60.0)
-                        # Cria uma nova thread para cada conexão de controle
-                        handler_thread = threading.Thread(
-                            target=self._handle_connection,
-                            args=(conn, addr),
-                            name=f"ControlHandler-{addr}",
-                            daemon=True # Permite que o programa saia mesmo se essas threads estiverem ativas
-                        )
-                        handler_thread.start()
-                    except socket.timeout:
-                        # Timeout é esperado para verificar self.running
-                        continue
-                    except OSError as e:
-                         # Pode ocorrer se o socket for fechado enquanto em accept()
-                         if self.running:
-                              logger.error(f"Erro de socket no accept(): {e}")
-                         break # Sai do loop se o socket tiver problemas sérios
+                    conn, addr = server_socket.accept()
+                    # Define timeout para a comunicação com o cliente
+                    conn.settimeout(60.0)
+                    logger.debug(f"Nova conexão de controle recebida de {addr}")
+                    # Trata cada conexão em sua própria thread para não bloquear accept
+                    handler_thread = threading.Thread(
+                        target=self._handle_connection,
+                        args=(conn, addr),
+                        name=f"ControlHandler-{addr}",
+                        daemon=True # Permite que o programa saia mesmo se estas threads estiverem rodando
+                    )
+                    handler_thread.start()
+                except socket.timeout:
+                    # Timeout em accept() é esperado, apenas continua verificando self.running
+                    continue
+                except OSError as e:
+                    # Erro no socket principal (ex: se for fechado externamente)
+                    if self.running: # Só loga erro se não estivermos parando intencionalmente
+                        logger.error(f"Erro de socket no accept(): {e}. Encerrando servidor de controle.")
+                        self._handle_critical_error(f"Control server accept error: {e}")
+                    break # Sai do loop while self.running
 
-                except Exception as e:
-                    # Erros ao iniciar a thread ou outros problemas
-                    if self.running:
-                        logger.error(f"Erro ao lidar com nova conexão de controle de {addr}: {e}", exc_info=True)
-                    if conn:
-                         try:
-                              conn.close()
-                         except: pass # Ignora erros ao fechar conexão com erro
-
-        except OSError as e:
-            logger.critical(f"Erro CRÍTICO ao iniciar servidor de controle em {self.host}:{self.port} - {e}. Verifique se a porta está em uso.", exc_info=True)
-            self.service_status = 'error'
-            self.running = False # Sinaliza para parar tudo
+        except (OSError, ValueError) as e:
+            logger.critical(f"Erro CRÍTICO ao iniciar/bind servidor de controle em {self.host}:{self.port} - {e}. Verifique permissões e se a porta está em uso.", exc_info=True)
+            self._handle_critical_error(f"Control server bind/init error: {e}")
         except Exception as e:
             logger.critical(f"Erro CRÍTICO inesperado no servidor de controle: {e}", exc_info=True)
-            self.service_status = 'error'
-            self.running = False
+            self._handle_critical_error(f"Unexpected control server error: {e}")
         finally:
             if server_socket:
-                try:
-                    server_socket.close()
-                except Exception as e:
-                     logger.error(f"Erro ao fechar socket do servidor de controle: {e}")
+                try: server_socket.close()
+                except: pass
             logger.info("Servidor de controle encerrado.")
 
-
-    def _handle_connection(self, conn, addr):
-        """Processa uma conexão de controle."""
+    def _handle_connection(self, conn: socket.socket, addr):
+        """Processa uma conexão de controle (start, stop, status, get_config, shutdown)."""
         command = "N/A"
-        response = b"Internal server error" # Default
+        response = b"Erro: Comando nao processado." # Mensagem de erro padrão
         try:
-            with conn: # Garante que conn.close() seja chamado
+            with conn: # Garante fechamento da conexão no final ou em erro
                 data_bytes = conn.recv(1024)
                 if not data_bytes:
-                    logger.warning(f"Conexão de {addr} fechada sem enviar dados.")
+                    logger.warning(f"Conexão de controle {addr} fechada sem enviar dados.")
                     return
 
+                # Decodifica o comando (assume UTF-8)
                 command = data_bytes.decode('utf-8', errors='ignore').strip().lower()
                 logger.info(f"Comando '{command}' recebido de {addr}")
 
-                if command == 'start' or command == 'iniciar':
+                # Valida ações permitidas (lidas da config)
+                allowed_actions = self.config_manager.get_config().get('service', {}).get('allowed_actions', [])
+                if command not in allowed_actions:
+                     logger.warning(f"Comando '{command}' de {addr} não está na lista de ações permitidas: {allowed_actions}")
+                     response = b"Erro: Comando nao permitido"
+                # Processa comandos válidos
+                elif command == 'start':
                     response = self._start_capture()
-                elif command == 'stop' or command == 'parar':
+                elif command == 'stop':
                     response = self._stop_capture()
                 elif command == 'status':
-                    # Inclui status da captura e talvez conectividade RabbitMQ
+                    # --- Status Aprimorado JSON ---
                     capture_status = 'running' if self.capturer and self.capturer.is_alive() else 'stopped'
+                    # Verifica conexões de forma mais segura
                     mq_status = 'connected' if self.rabbitmq_channel and self.rabbitmq_channel.is_open else 'disconnected'
-                    response_str = f"Service: {self.service_status}, Capture: {capture_status}, RabbitMQ: {mq_status}"
-                    response = response_str.encode('utf-8')
+                    redis_status = 'connected' if self.redis_client and self.redis_client.get_connection() else 'disconnected' # get_connection pode tentar reconectar
+                    current_service_status = self.config_manager.get_service_status()
+
+                    status_dict = {
+                        "service_status": current_service_status,
+                        "capture": {
+                            "status": capture_status,
+                            "interface": self.interface,
+                            "filter": self.filter_rules
+                        },
+                        "dependencies": {
+                            "rabbitmq": mq_status,
+                            "redis": redis_status
+                        },
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) # Adiciona timestamp UTC
+                    }
+                    try:
+                         # Converte para JSON (sem indentação para economizar bytes)
+                         response = json.dumps(status_dict, separators=(',', ':')).encode('utf-8')
+                    except Exception as json_e:
+                         logger.error(f"Erro ao serializar status para JSON: {json_e}")
+                         response = b'{"error": "Failed to serialize status to JSON"}'
+
                 elif command == 'get_config':
                     try:
                         config_data = self.config_manager.get_config()
-                        # Adiciona informações de estado atuais à resposta
+                        # Adiciona informações de runtime que não estão na config salva
                         runtime_info = {
                             'active_interface': self.interface,
                             'active_filter': self.filter_rules,
                             'active_log_level': logging.getLevelName(logger.getEffectiveLevel()),
-                            'service_status': self.service_status,
+                            'service_status': self.config_manager.get_service_status(),
                             'capture_running': bool(self.capturer and self.capturer.is_alive()),
-                            'rabbitmq_connected': bool(self.rabbitmq_channel and self.rabbitmq_channel.is_open)
+                            'rabbitmq_connected': bool(self.rabbitmq_channel and self.rabbitmq_channel.is_open),
+                            'redis_connected': bool(self.redis_client and self.redis_client.get_connection())
                         }
-                        # Merge runtime info into a copy of config_data to avoid modifying the original
-                        response_data = {**config_data, 'runtime_info': runtime_info}
-
-                        response = json.dumps(response_data, indent=2, default=str).encode('utf-8') # default=str para lidar com tipos não serializáveis
+                        # Usa deepcopy para não modificar a config original ao adicionar runtime_info
+                        response_data = {**copy.deepcopy(config_data), 'runtime_info': runtime_info}
+                        # Serializa com indentação para leitura humana
+                        response = json.dumps(response_data, indent=2, default=str).encode('utf-8')
                     except Exception as e:
-                        logger.error(f"Erro ao obter/serializar configuração para {addr}: {e}", exc_info=True)
-                        response = b"Error getting or formatting config"
-                elif command == 'shutdown': # Comando para parar o serviço inteiro
-                     response = b"Shutdown initiated"
-                     self.stop() # Inicia o processo de parada total
-                else:
-                    response = b"Invalid command"
+                        logger.error(f"Erro ao obter/serializar config para {addr}: {e}", exc_info=True)
+                        response = b'{"error": "Failed to get or format configuration"}'
 
+                elif command == 'shutdown':
+                    response = b"Comando 'shutdown' recebido. Iniciando parada..."
+                    logger.warning(f"Comando 'shutdown' recebido de {addr}. Solicitando parada do serviço.")
+                    # Chama self.stop() em uma nova thread para não bloquear a resposta
+                    # Usamos a flag 'running' que será verificada pelo loop principal
+                    self.stop() # Apenas seta a flag self.running = False
+
+                else:
+                    # Comando estava em allowed_actions mas não foi tratado acima? Log erro.
+                    logger.error(f"Comando permitido '{command}' não foi tratado em _handle_connection!")
+                    response = b"Erro: Comando permitido mas nao implementado no handler"
+
+                # Envia a resposta
                 conn.sendall(response)
-                # Log limitado da resposta para evitar poluição com config grande
-                response_log = response if len(response) < 200 else response[:197] + b'...'
-                logger.debug(f"Resposta enviada para {addr} para comando '{command}': {response_log.decode('utf-8', errors='ignore')}")
+                # Log limitado da resposta
+                response_log = response if len(response) < 250 else response[:247] + b'...'
+                logger.debug(f"Resposta enviada para {addr} (Cmd: '{command}'): {response_log.decode('utf-8', 'ignore')}")
 
         except socket.timeout:
-            logger.warning(f"Conexão de controle com {addr} expirou (timeout) ao receber/enviar.")
-        except (socket.error, ConnectionResetError) as e:
-            logger.warning(f"Erro de socket na conexão de controle com {addr}: {e}")
+            logger.warning(f"Timeout (>60s) na comunicação com cliente de controle {addr}. Fechando.")
+        except (socket.error, ConnectionResetError, BrokenPipeError) as e:
+            logger.warning(f"Erro de socket ou conexão perdida com cliente de controle {addr}: {e}")
         except Exception as e:
+            # Erro genérico no processamento do comando
             logger.error(f"Erro ao processar comando '{command}' de {addr}: {e}", exc_info=True)
-            # Tenta enviar uma mensagem de erro genérica se possível
             try:
-                conn.sendall(b"Error processing command on server")
+                # Tenta enviar uma mensagem de erro genérica
+                conn.sendall(b'{"error": "Internal server error processing command"}')
             except:
-                pass # Ignora se não conseguir enviar
-        finally:
-             logger.debug(f"Conexão de controle com {addr} fechada.")
+                pass # Ignora erro ao enviar mensagem de erro
+        # finally: O 'with conn:' garante o fechamento.
 
-
-    def _start_capture(self):
-        """Inicia a captura de pacotes em uma thread separada."""
+    def _start_capture(self) -> bytes:
+        """Inicia a captura de pacotes (se não estiver rodando). Retorna bytes da resposta."""
         if self.capturer and self.capturer.is_alive():
             logger.warning("Tentativa de iniciar captura que já está rodando.")
-            return b"Capture already running"
+            return b'{"status": "warning", "message": "Capture already running"}'
 
+        # Verifica dependências essenciais ANTES de criar a thread
         if not self.interface:
-            logger.error("Não é possível iniciar a captura: interface de rede não definida.")
-            self.service_status = 'error'
-            return b"Error: Network interface not set"
+            logger.error("Não é possível iniciar captura: interface não definida.")
+            self._handle_critical_error("Capture failed: interface not defined")
+            return b'{"status": "error", "message": "Capture interface not defined"}'
+
+        # Verifica conexões novamente
+        if not self._connect_to_rabbitmq(retries=1): # Tenta rápido
+            logger.error("Falha ao conectar/reconectar ao RabbitMQ. Captura não iniciada.")
+            # Não consideramos erro fatal para o serviço todo, mas a captura falha
+            self.config_manager.set_service_status('error') # Status do serviço vira erro
+            return b'{"status": "error", "message": "Failed to connect to RabbitMQ"}'
+        if not self.redis_client or not self.redis_client.get_connection(): # Tenta rápido
+            logger.error("Falha ao conectar/reconectar ao Redis. Captura não iniciada.")
+            self.config_manager.set_service_status('error')
+            return b'{"status": "error", "message": "Failed to connect to Redis"}'
 
         logger.info(f"Iniciando captura na interface: {self.interface} com filtro: '{self.filter_rules}'")
         try:
-            # Garante que estamos conectados ao RabbitMQ antes de iniciar a captura
-            if not self._connect_to_rabbitmq():
-                 logger.error("Falha ao conectar/reconectar ao RabbitMQ. Não é possível iniciar a captura.")
-                 self.service_status = 'error'
-                 return b"Error: Cannot connect to RabbitMQ"
-
-            # Cria e inicia o capturador
             self.capturer = PacketCapturer(
                 interface=self.interface,
                 packet_handler=self._process_packet,
                 filter_rules=self.filter_rules,
-                #stop_event=threading.Event() Passa um evento para parada limpa
             )
-            self.capturer.start() # Inicia a thread de captura (deve ser Thread)
-            time.sleep(0.5) # Pequena pausa para a thread iniciar
+            self.capturer.start() # Inicia a thread de captura
+            time.sleep(0.5) # Pausa para dar tempo da thread iniciar/falhar
 
             if self.capturer.is_alive():
-                 self.service_status = 'running'
-                 logger.info("Captura de pacotes iniciada com sucesso.")
-                 return b"Capture started"
+                self.service_status = 'running'
+                self.config_manager.set_service_status(self.service_status)
+                logger.info("Captura de pacotes iniciada com sucesso.")
+                return b'{"status": "success", "message": "Capture started"}'
             else:
-                 logger.error("Thread de captura não iniciou corretamente.")
-                 self.service_status = 'error'
-                 self.capturer = None
-                 return b"Error: Capture thread failed to start"
+                logger.error("Thread de captura não iniciou corretamente (ver logs do PacketCapturer).")
+                self.service_status = 'error'
+                self.config_manager.set_service_status(self.service_status)
+                self.capturer = None
+                return b'{"status": "error", "message": "Failed to start capture thread"}'
 
+        except PermissionError:
+             logger.critical("Erro de permissão ao iniciar captura (Scapy). Execute com privilégios.", exc_info=True)
+             self._handle_critical_error("Capture failed: Permission denied")
+             return b'{"status": "error", "message": "Permission denied to start capture"}'
         except Exception as e:
-            logger.error(f"Falha CRÍTICA ao iniciar a thread de captura: {e}", exc_info=True)
-            self.service_status = 'error'
-            self.capturer = None # Garante que não fique em estado inconsistente
-            return b"Error starting capture thread"
+            logger.error(f"Falha CRÍTICA ao criar/iniciar a thread de captura: {e}", exc_info=True)
+            self._handle_critical_error(f"Capture failed: {e}")
+            return b'{"status": "error", "message": "Critical error starting capture"}'
 
-
-    def _stop_capture(self):
-        """Para a thread de captura de pacotes."""
+    def _stop_capture(self) -> bytes:
+        """Para a thread de captura de pacotes. Retorna bytes da resposta."""
         if self.capturer and self.capturer.is_alive():
             logger.info("Parando a captura de pacotes...")
+            stopped_cleanly = False
             try:
-                self.capturer.stop() # Sinaliza para a thread parar (via stop_event)
-                #self.capturer.join(timeout=10.0) # Espera a thread terminar
-
-                if self.capturer.is_alive():
-                    logger.warning("Timeout ao esperar a thread de captura terminar. Pode haver pacotes sendo processados.")
-                    # Considerar medidas mais drásticas se necessário
+                self.capturer.stop() # Sinaliza para parar
+                # Espera um pouco pela thread terminar (join opcional)
+                self.capturer.capture_thread.join(timeout=3.0) # Espera até 3s
+                if not self.capturer.is_alive():
+                     stopped_cleanly = True
+                     logger.info("Thread de captura encerrada graciosamente.")
                 else:
-                    logger.info("Thread de captura terminada com sucesso.")
-
+                     logger.warning("Thread de captura não encerrou no tempo esperado após stop().")
             except Exception as e:
-                logger.error(f"Erro ao parar/juntar a thread de captura: {e}", exc_info=True)
-                # Mesmo com erro, consideramos parado para fins de status
+                logger.error(f"Erro ao sinalizar/aguardar parada da thread de captura: {e}", exc_info=True)
             finally:
-                 self.capturer = None # Libera a referência
-                 self.service_status = 'stopped'
-                 logger.info("Captura de pacotes finalizada.")
-                 return b"Capture stopped"
+                self.capturer = None # Libera referência de qualquer forma
+                self.service_status = 'stopped'
+                self.config_manager.set_service_status(self.service_status)
+                logger.info("Sinal de parada enviado e referência ao capturador liberada.")
+                if stopped_cleanly:
+                    return b'{"status": "success", "message": "Capture stopped"}'
+                else:
+                     return b'{"status": "warning", "message": "Capture stop requested, thread termination uncertain"}'
         else:
-            logger.info("Captura de pacotes já estava parada.")
-            self.service_status = 'stopped' # Garante que o status está correto
-            return b"Capture not running"
+            logger.info("Comando 'stop' recebido, mas captura já estava parada.")
+            # Garante que o status está correto
+            if self.config_manager.get_service_status() != 'stopped':
+                self.service_status = 'stopped'
+                self.config_manager.set_service_status(self.service_status)
+            return b'{"status": "info", "message": "Capture was not running"}'
 
-
-    def _process_packet(self, packet):
-        """Normaliza o pacote, loga no Journal e envia para o RabbitMQ."""
-        if not self.running: # Verifica se o serviço está parando
+    def _process_packet(self, packet: Packet):
+        """
+        Processa um pacote: normaliza, verifica bloqueio no Redis,
+        e envia para RabbitMQ se não estiver bloqueado.
+        """
+        # Verificações rápidas para evitar processamento desnecessário
+        if not self.running: return
+        if not self.redis_client or not self.rabbitmq_channel or not self.rabbitmq_channel.is_open:
+            # Log esporádico para não floodar
+            if time.monotonic() % 10 < 1: # A cada ~10 segundos
+                logger.warning("_process_packet: Serviço parando ou Redis/RabbitMQ indisponível. Descartando pacote.")
             return
-        try:
-            processed = PacketNormalizer.normalize(packet)
 
-            if processed:
-                # Validação de IP (essencial)
-                src_ip = processed.get('src_ip')
-                dst_ip = processed.get('dst_ip')
-                if not self._validate_ip(src_ip) or not self._validate_ip(dst_ip):
-                    logger.warning(f"IP inválido detectado no pacote: SRC='{src_ip}', DST='{dst_ip}'. Pacote descartado.")
-                    # Log extra opcional com mais detalhes:
-                    # logger.debug("Detalhes do pacote com IP inválido:", extra={'PACKET_DETAILS': str(processed)})
+        try:
+            # 1. Normaliza o pacote
+            # Passamos o pacote Scapy diretamente
+            normalized_data = PacketNormalizer.normalize(packet)
+
+            # 2. Verifica se a normalização foi bem sucedida e obtém IPs
+            if normalized_data:
+                src_ip = normalized_data.get('src_ip')
+                dst_ip = normalized_data.get('dst_ip')
+
+                # Validação mínima (IPs devem existir após normalização)
+                if not src_ip or not dst_ip:
+                     # PacketNormalizer já deve ter validado, mas verificamos aqui por segurança
+                    logger.debug(f"IP inválido/ausente no pacote normalizado: SRC='{src_ip}', DST='{dst_ip}'. Descartado.")
                     return
 
-                # ---- Log Estruturado para Systemd Journal ----
-                # Converte todos os valores para string para segurança no Journal
-                extra_data = {
-                    'NETWORK_PROTOCOL': str(processed.get('protocol', 'UNKNOWN')).upper(),
-                    'SOURCE_IP': str(src_ip),
-                    'DESTINATION_IP': str(dst_ip),
-                    'SOURCE_PORT': str(processed.get('src_port', 'N/A')),
-                    'DESTINATION_PORT': str(processed.get('dst_port', 'N/A')),
-                    'SOURCE_MAC': str(processed.get('src_mac', 'N/A')),
-                    'DESTINATION_MAC': str(processed.get('dst_mac', 'N/A')),
-                    'PACKET_SIZE': str(processed.get('packet_size', -1)),
-                    'IP_VERSION': str(processed.get('ip_version', 'N/A')),
-                    'TCP_FLAGS': str(processed.get('tcp_flags', 'N/A')),
-                    # Adicionar mais campos normalizados aqui, sempre como string
-                    'TIMESTAMP_PROCESS': time.strftime('%Y-%m-%dT%H:%M:%S%z') # Timestamp do processamento
-                }
-                # Logar em nível DEBUG para não poluir o log principal
-                logger.debug("Packet processed", extra=extra_data)
-                # ---- Fim do Log Estruturado ----
-
-
-                # ---- Envia para o RabbitMQ ----
+                # 3. Verifica bloqueio no Redis (IP de ORIGEM)
                 try:
-                    # Verifica conexão antes de publicar
-                    if not self.rabbitmq_channel or not self.rabbitmq_channel.is_open:
-                         logger.warning("Canal RabbitMQ fechado/indisponível. Tentando reconectar antes de publicar...")
-                         if not self._connect_to_rabbitmq(retries=1, delay=1): # Tenta reconectar rapidamente
-                              logger.error("Falha ao reconectar ao RabbitMQ. Mensagem perdida.")
-                              # Considerar fila de espera local ou descarte
-                              return # Perde a mensagem atual
+                    is_blocked = self.redis_client.is_blocked(src_ip)
+                except Exception as redis_err:
+                    # Loga o erro e assume não bloqueado para não parar o fluxo por erro no Redis
+                    logger.error(f"Erro ao verificar bloqueio Redis para {src_ip}: {redis_err}. Assumindo não bloqueado.")
+                    is_blocked = False
 
-                    message_body = json.dumps(processed, default=str) # default=str para segurança
-                    self.rabbitmq_channel.basic_publish(
-                        exchange='',
-                        routing_key=self.rabbitmq_queue,
-                        body=message_body,
-                        properties=pika.BasicProperties(
-                            delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE # Mensagens persistentes
-                        )
-                    )
-                    # logger.debug(f"Pacote publicado na fila '{self.rabbitmq_queue}'") # Log muito verboso
+                if is_blocked:
+                    # Log em nível DEBUG para não poluir
+                    logger.debug(f"IP {src_ip} está bloqueado (Redis). Pacote descartado.")
+                    # Contadores podem ser mais úteis que logs aqui para produção
+                    return # <<< NÃO ENVIA PARA ANÁLISE >>>
 
-                except (pika.exceptions.AMQPConnectionError, pika.exceptions.ChannelClosedByBroker, pika.exceptions.StreamLostError) as e:
-                     logger.error(f"Erro de conexão/canal com RabbitMQ ao publicar: {e}. Tentará reconectar na próxima vez.")
-                     self._close_rabbitmq_connection() # Força fechamento para tentar reconexão
-                except Exception as e:
-                    logger.error(f"Erro inesperado ao publicar mensagem no RabbitMQ: {e}", exc_info=True)
-                    # Considerar estratégia de retry ou dead-letter queue
+                # 4. Se não bloqueado, envia para análise via RabbitMQ
+                self._send_to_rabbitmq(normalized_data)
+
+                # 5. Log Opcional (removido por padrão para performance)
+                # logger.debug(f"Pacote [{src_ip}:{normalized_data.get('src_port')} -> {dst_ip}:{normalized_data.get('dst_port')}] enviado para analise.")
+
+            # else: O PacketNormalizer descartou o pacote (ruído, broadcast, etc.) ou falhou. Logs devem vir dele.
 
         except Exception as e:
-            logger.error(f"Erro durante o processamento/normalização do pacote: {e}", exc_info=True)
-            # Tentar logar informações básicas do pacote original se possível
-            try:
-                if packet:
-                     summary = packet.summary() if hasattr(packet, 'summary') else 'No summary'
-                     logger.error(f"Detalhes do pacote bruto (resumo): {summary[:200]}") # Limita tamanho
-            except:
-                pass # Evita erros no tratamento de erro
+            # Erro genérico no processamento deste pacote específico
+            logger.error(f"Erro durante _process_packet para {packet.summary()[:150]}: {e}", exc_info=True)
 
-    @staticmethod
-    def _validate_ip(ip: str) -> bool:
-        """Valida se uma string é um endereço IP válido (IPv4 ou IPv6)."""
-        if not ip or not isinstance(ip, str):
-            return False
+    def _send_to_rabbitmq(self, data: Dict[str, Any]):
+        """Envia dados normalizados para a fila de pacotes do RabbitMQ."""
+        # Verifica se o canal está pronto
+        if not self.rabbitmq_channel or not self.rabbitmq_channel.is_open:
+            logger.warning("Tentativa de envio MQ, mas canal fechado. Tentando reconectar...")
+            # Tenta reconectar rapidamente. Se falhar, a mensagem é perdida.
+            if not self._connect_to_rabbitmq(retries=1, delay=0):
+                logger.error("Falha ao reconectar MQ rapidamente. Mensagem perdida.")
+                return
+            # Se reconectou, o canal deve estar pronto agora
+
         try:
-            ipaddress.ip_address(ip)
-            return True
-        except ValueError:
-            return False
+            # Serializa os dados para JSON
+            message_body = json.dumps(data, default=str, separators=(',', ':')) # Compacto
 
-    # Removido _log_packet por redundância com log estruturado
+            # Publica a mensagem
+            self.rabbitmq_channel.basic_publish(
+                exchange='', # Usa exchange default
+                routing_key=self.rabbitmq_packet_queue, # Fila de destino
+                body=message_body,
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE # Marca como persistente
+                )
+            )
+            # Log muito verboso para produção
+            # logger.debug(f"Dados enviados para fila '{self.rabbitmq_packet_queue}'")
+
+        except (pika.exceptions.AMQPConnectionError,
+                pika.exceptions.ChannelClosedByBroker,
+                pika.exceptions.StreamLostError,
+                pika.exceptions.ChannelWrongStateError, # Adicionado
+                AttributeError) as conn_err: # AttributeError se channel for None
+            # Erros que indicam problema na conexão/canal
+            logger.error(f"Erro de conexão/canal RabbitMQ ao publicar: {conn_err.__class__.__name__}. Tentará reconectar.")
+            # Força fechamento para limpar estado e tentar reconectar na próxima vez
+            self._close_rabbitmq_connection()
+        except Exception as e:
+            # Outros erros (ex: serialização JSON, erro inesperado do Pika)
+            logger.error(f"Erro inesperado ao publicar no RabbitMQ: {e}", exc_info=True)
+            # Considerar estratégia de retry ou dead-letter queue aqui pode ser útil
+            # Dependendo do erro, forçar reconexão pode ou não ajudar
+            # self._close_rabbitmq_connection() # Opcional
+
+    # @staticmethod # Não precisa ser staticmethod se não usa 'self'
+    # def _validate_ip(ip: str) -> bool:
+    #     """Valida se uma string é um endereço IP válido (IPv4 ou IPv6)."""
+    #     # Simplificado, pois PacketNormalizer e RedisClient já validam
+    #     return isinstance(ip, str) and ip is not None
 
     def _signal_handler(self, signum, frame):
         """Manipula sinais de desligamento (SIGINT, SIGTERM)."""
         signal_name = signal.Signals(signum).name
-        logger.warning(f"Sinal {signal_name} ({signum}) recebido. Iniciando encerramento gracioso...")
-        # Inicia a parada em uma nova thread para não bloquear o handler
-        # Embora 'stop' tente ser rápido, é mais seguro não fazer trabalho pesado no handler
-        if self.running: # Evita múltiplas chamadas se o sinal for repetido
-             # Não inicia thread aqui, apenas seta a flag. O loop principal ou join() cuida.
-             self.running = False
-             logger.info("Flag 'running' definida como False. Serviço irá parar.")
-             # A chamada self.stop() será feita no _cleanup() ou ao sair do loop principal
+        if self.running:
+            logger.warning(f"Sinal {signal_name} ({signum}) recebido. Iniciando parada...")
+            self.stop() # Chama o método stop que seta self.running = False
         else:
-             logger.warning("Sinal recebido, mas o serviço já estava em processo de parada.")
-
+            logger.warning(f"Sinal {signal_name} ({signum}) recebido, mas serviço já estava parando.")
 
     def stop(self):
-        """Inicia o processo de parada graciosa do serviço."""
+        """Inicia o processo de parada graciosa do serviço (chamado pelo handler ou API)."""
         if not self.running:
-            # logger.info("Processo de parada já iniciado.")
-            return # Evita múltiplas chamadas concorrentes
+            # logger.debug("Processo de parada já iniciado.")
+            return # Evita chamadas múltiplas
 
-        logger.info("Iniciando procedimento de parada do serviço...")
+        logger.info("Solicitando parada do serviço IDSController...")
         self.running = False # Sinaliza para todos os loops pararem
-        # Chama a limpeza real. Isso pode ser chamado pelo signal handler indiretamente
-        # ou pelo comando 'shutdown' ou no final do loop principal
-        self._cleanup()
 
+        # Atualiza status na config (se possível)
+        current_status = self.config_manager.get_service_status() if self.config_manager else 'unknown'
+        if current_status not in ['stopped', 'stopping', 'error']:
+             if self.config_manager:
+                  try: self.config_manager.set_service_status('stopping')
+                  except: pass # Ignora erro ao salvar status
+
+        # NÃO chamar cleanup aqui. O loop principal chamará ao sair.
 
     def _cleanup(self):
-         """Realiza a parada efetiva dos componentes."""
-         logger.info("Executando limpeza dos recursos...")
+        """Realiza a parada efetiva dos componentes e fecha conexões."""
+        logger.info("Executando limpeza dos recursos do IDSController...")
+        final_status = 'stopped' # Assume parada normal, a menos que já esteja em erro
 
-         # 1. Para a captura de pacotes primeiro
-         try:
-             self._stop_capture()
-         except Exception as e:
-             logger.error(f"Erro durante _stop_capture na limpeza: {e}", exc_info=True)
+        # 1. Para a captura de pacotes (garante que pare se ainda estiver ativa)
+        if self.capturer and self.capturer.is_alive():
+            logger.info("Garantindo parada da captura na limpeza...")
+            self._stop_capture() # Tenta parar e aguardar um pouco
 
-         # 2. Fecha a conexão com RabbitMQ
-         try:
-             self._close_rabbitmq_connection()
-         except Exception as e:
-             logger.error(f"Erro durante _close_rabbitmq_connection na limpeza: {e}", exc_info=True)
+        # 2. Fecha a conexão com RabbitMQ
+        logger.debug("Fechando conexão RabbitMQ na limpeza...")
+        self._close_rabbitmq_connection()
 
-         # 3. Outras limpezas se necessário (ex: fechar socket de controle já é feito no finally da thread)
+        # 3. Fecha a conexão com Redis
+        logger.debug("Fechando conexão Redis na limpeza...")
+        if self.redis_client:
+            self.redis_client.close()
 
-         self.service_status = 'stopped'
-         logger.info("Controlador IDS e seus componentes foram parados.")
-         # Não chamar exit() aqui, deixa o fluxo principal terminar
+        # 4. Fecha socket de controle (a thread deve terminar ao self.running=False)
+        # Apenas logamos que estamos parando
+        logger.debug("Sinalizando para threads auxiliares terminarem...")
+
+        # 5. Define o status final (a menos que já esteja 'error')
+        if self.config_manager:
+            if self.config_manager.get_service_status() != 'error':
+                try: self.config_manager.set_service_status(final_status)
+                except: pass # Ignora erro ao salvar status final
+
+        logger.info(f"Limpeza do Controlador IDS concluída. Status final: {self.config_manager.get_service_status() if self.config_manager else 'unknown'}.")
 
 
 # --- Ponto de Entrada Principal ---
 if __name__ == "__main__":
-    controller = None
+    controller: Optional[IDSController] = None
     exit_code = 0
     try:
-        logger.info("Iniciando aplicação IDS...")
+        logger.info("Iniciando aplicação IDSController...")
         controller = IDSController()
-        controller.start() # Bloqueia ou executa até self.running ser False
+        # O start() agora bloqueia até que 'running' seja False
+        controller.start()
+        logger.info("Aplicação IDSController: controller.start() retornou.")
     except RuntimeError as e:
-        # Erros fatais durante a inicialização já logados no __init__
+        # Erros fatais durante a inicialização já logados
         logger.critical(f"Encerrando devido a erro fatal na inicialização: {e}")
         exit_code = 1
     except KeyboardInterrupt:
-        logger.warning("Interrupção pelo teclado (Ctrl+C) detectada no nível principal.")
-        exit_code = 0 # Saída normal após Ctrl+C
+        logger.warning("Interrupção pelo teclado (Ctrl+C) detectada.")
+        # O signal handler (se configurado) ou a exceção devem ter chamado stop()
+        # O fluxo normal levará ao _cleanup() após sair do start()
+        exit_code = 0 # Saída normal
     except Exception as e:
-        logger.critical(f"Erro não tratado no nível principal ('__main__'): {e}", exc_info=True)
-        exit_code = 1 # Erro inesperado
+        logger.critical(f"Erro não tratado no nível principal: {e}", exc_info=True)
+        exit_code = 1
+        # Tenta garantir que a flag de parada seja setada em caso de erro inesperado
+        if controller and controller.running:
+             controller.running = False
+             # O cleanup será chamado no finally
     finally:
-        logger.info("Aplicação IDS encerrando...")
-        if controller and controller.running: # Se ainda estiver rodando (ex: KeyboardInterrupt)
-            logger.info("Chamando controller.stop() na saída final.")
-            controller.stop() # Tenta parada graciosa
-        logger.info(f"Aplicação IDS finalizada com código de saída: {exit_code}")
-        # Opcional: Esperar um pouco para garantir que os logs sejam escritos
-        # time.sleep(1)
-        exit(exit_code) # Encerra o processo
+        logger.info("Aplicação IDSController no bloco finally...")
+        # O cleanup é chamado ao final normal ou com erro do controller.start()
+        # Não precisamos chamar explicitamente aqui, a menos que a instanciação falhe
+        if controller is None and exit_code == 0: # Caso raro: falha antes mesmo de instanciar
+             exit_code = 1 # Indica erro se não conseguiu nem instanciar
+
+        logger.info(f"Aplicação IDSController finalizada com código de saída: {exit_code}")
+        # Pequena pausa para garantir que logs sejam escritos antes de sair
+        time.sleep(0.5)
+        exit(exit_code)

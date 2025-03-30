@@ -9,6 +9,27 @@ logging.basicConfig(level=logging.INFO)
 IDS_HOST = 'localhost'  # Assumindo que ids.service roda na mesma máquina
 IDS_PORT = 65432
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Verifica a saúde da API de controle e tenta pingar o socket do IDS."""
+    api_status = {"status": "ok", "component": "api_control"}
+    try:
+        # Tenta conectar ao socket do main.py rapidamente
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5) # Timeout bem curto
+            sock.connect((IDS_HOST, IDS_PORT))
+        api_status["dependencies"] = {"ids_service_socket": "listening"}
+        status_code = 200
+    except (socket.timeout, ConnectionRefusedError):
+        api_status["dependencies"] = {"ids_service_socket": "unreachable"}
+        status_code = 200 # A API em si está ok, mas a dependência não
+    except Exception as e:
+        logger.error(f"Erro inesperado no health check ao verificar socket IDS: {e}")
+        api_status["status"] = "error"
+        api_status["error"] = f"Erro ao verificar socket IDS: {e}"
+        status_code = 500 # Erro interno da API de health check
+    return jsonify(api_status), status_code
+
 @app.route('/ids/comando', methods=['POST'])
 def receber_comando():
     """
