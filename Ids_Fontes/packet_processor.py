@@ -10,24 +10,23 @@ from scapy.packet import Packet
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet6 import IPv6
-from queue import Queue
+from queue import Queue, Empty
 
 logger = logging.getLogger(__name__)
 
 class PacketCapturer:
-    """Classe para captura de pacotes de rede em uma ou mais interfaces."""
-
-    def __init__(self, interfaces: List[str], packet_handler: Callable[[Packet], None], filter_rules: str = "ip or ip6", buffer_size: int = 1000):
+    def __init__(self, interfaces: str | List[str], packet_handler: Callable[[Packet], None], filter_rules: str = "ip or ip6", buffer_size: int = 1000):
         """
         Inicializa o capturador.
 
         Args:
-            interfaces: Lista de interfaces de rede para captura.
+            interfaces: Interface de rede (string) ou lista de interfaces para captura.
             packet_handler: Função para processar cada pacote capturado.
             filter_rules: Regras de filtro para o Scapy (ex.: 'ip or ip6').
             buffer_size: Tamanho máximo do buffer de pacotes.
         """
-        self.interfaces = interfaces
+        # Normaliza para lista
+        self.interfaces = [interfaces] if isinstance(interfaces, str) else interfaces
         self.packet_handler = packet_handler
         self.filter_rules = filter_rules
         self.buffer_size = buffer_size
@@ -36,17 +35,18 @@ class PacketCapturer:
         self.capture_threads: List[threading.Thread] = []
         self.packet_queue = Queue(maxsize=buffer_size)
         self.processor_thread: Optional[threading.Thread] = None
-
-    def start(self) -> bool:
-        """Inicia a captura em todas as interfaces especificadas."""
+    
+    def start(self) -> bool: 
         with self.running_lock:
             if self.running:
                 logger.warning("Captura já está em execução.")
                 return False
 
-        # Valida interfaces e permissões
         available_interfaces = scapy.get_if_list()
         for iface in self.interfaces:
+            if not isinstance(iface, str) or not iface.strip():
+                logger.error(f"Valor inválido para interface: {iface}")
+                return False
             if iface not in available_interfaces:
                 logger.error(f"Interface inválida ou não encontrada: {iface}")
                 return False
@@ -56,7 +56,6 @@ class PacketCapturer:
 
         self.running = True
         try:
-            # Inicia threads de captura para cada interface
             for iface in self.interfaces:
                 thread = threading.Thread(
                     target=self._capture_loop,
@@ -67,7 +66,6 @@ class PacketCapturer:
                 self.capture_threads.append(thread)
                 thread.start()
 
-            # Inicia thread de processamento do buffer
             self.processor_thread = threading.Thread(
                 target=self._process_buffer,
                 name="PacketProcessor",
@@ -130,7 +128,7 @@ class PacketCapturer:
                 packet = self.packet_queue.get(timeout=1)
                 self._handle_packet(packet)
                 self.packet_queue.task_done()
-            except Queue.Empty:
+            except Empty:  # Alterado de Queue.Empty para Empty
                 continue
             except Exception as e:
                 logger.error(f"Erro ao processar pacote do buffer: {e}", exc_info=True)
@@ -138,18 +136,21 @@ class PacketCapturer:
     def _handle_packet(self, packet: Packet) -> None:
         """Processa cada pacote capturado."""
         try:
-            # Logging reduzido para performance; habilitar apenas em debug
             if logger.isEnabledFor(logging.DEBUG):
-                if UDP in packet:
-                    logger.debug(f"UDP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
-                elif TCP in packet:
-                    logger.debug(f"TCP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
-                elif ICMP in packet:
-                    logger.debug(f"ICMP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
-                elif IPv6 in packet:
+                if IPv6 in packet:
                     logger.debug(f"IPv6: {packet.summary()} | {packet[IPv6].src} -> {packet[IPv6].dst}")
+                elif IP in packet:
+                    if UDP in packet:
+                        logger.debug(f"UDP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
+                    elif TCP in packet:
+                        logger.debug(f"TCP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
+                    elif ICMP in packet:
+                        logger.debug(f"ICMP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
+                    else:
+                        logger.debug(f"IP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
                 else:
-                    logger.debug(f"Outro: {packet.summary()}")
+                    logger.debug(f"Sem camada IP: {packet.summary()}")
+
             self.packet_handler(packet)
         except Exception as e:
             logger.error(f"Erro ao processar pacote: {e}", exc_info=True)

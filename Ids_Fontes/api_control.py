@@ -1,5 +1,6 @@
 # /home/admin/ids_project/api_control.py
 
+import json
 import logging
 import socket
 import threading
@@ -30,14 +31,12 @@ def send_command(command: str, timeout: float = 5.0) -> Dict[str, Any]:
             s.settimeout(timeout)
             s.connect((IDS_HOST, IDS_PORT))
             s.sendall(command.encode('utf-8'))
-            if command == 'status' or command == 'get_config':
-                response = s.recv(4096).decode('utf-8')
-                return {"status": "success", "data": json.loads(response)}
-            return {"status": "success", "message": f"Comando '{command}' enviado"}
+            response = s.recv(4096).decode('utf-8')
+            return json.loads(response)  # Agora tudo é JSON
     except socket.timeout:
         return {"status": "error", "message": "Timeout ao conectar ao IDS"}
     except ConnectionRefusedError:
-        return {"status": "error", "message": "Conexao com IDS recusada"}
+        return {"status": "error", "message": "Conexão com IDS recusada"}
     except Exception as e:
         logger.error(f"Erro ao enviar comando '{command}': {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
@@ -50,22 +49,22 @@ def check_auth():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Verifica a saúde da API e do IDS."""
     check_auth()
     config_manager = ConfigManager()
     api_status = {"status": "ok", "component": "api_control"}
     dependencies = {}
 
     try:
-        result = send_command('status', timeout=1.0)
+        result = send_command('status', timeout=3.0)  # Aumentado de 1.0 para 3.0
+        logger.info(f"Resposta do IDS para 'status': {result}")
         if result["status"] == "success":
-            dependencies["ids_service"] = result["data"]
+            dependencies["ids_service"] = result
         else:
             dependencies["ids_service"] = {"status": "unreachable", "error": result["message"]}
         api_status["dependencies"] = dependencies
         return jsonify(api_status), 200
     except Exception as e:
-        logger.error(f"Erro no health check: {e}")
+        logger.error(f"Erro no health check: {e}", exc_info=True)
         api_status["status"] = "error"
         api_status["error"] = str(e)
         return jsonify(api_status), 500

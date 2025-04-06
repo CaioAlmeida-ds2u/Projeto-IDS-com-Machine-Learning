@@ -29,7 +29,7 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 # Configuração global de noisy_ports
-_DEFAULT_NOISY_PORTS: List[int] = [137, 138, 139, 1900, 5353]  # Padrão: NetBIOS, SSDP, mDNS
+_DEFAULT_NOISY_PORTS: List[int] = [53, 137, 138, 139, 1900, 5353, 15672]  # Exemplo de portas ruidosas
 _MODULE_NOISY_PORTS: Set[int] = set(_DEFAULT_NOISY_PORTS)
 
 try:
@@ -85,14 +85,23 @@ class MulticastFilter(PacketFilter):
         return True
 
 class LoopbackFilter(PacketFilter):
-    """Filtro para pacotes loopback."""
+    """Filtro para pacotes loopback e link-local."""
     def apply(self, packet_data: Dict[str, Any]) -> bool:
         src_ip, dst_ip = packet_data.get('src_ip'), packet_data.get('dst_ip')
         try:
-            src_loop = src_ip and ipaddress.ip_address(src_ip).is_loopback
-            dst_loop = dst_ip and ipaddress.ip_address(dst_ip).is_loopback
-            if src_loop or dst_loop:
-                logger.debug(f"Pacote loopback descartado: {src_ip} -> {dst_ip}")
+            src_ip_obj = ipaddress.ip_address(src_ip) if src_ip else None
+            dst_ip_obj = ipaddress.ip_address(dst_ip) if dst_ip else None
+            
+            # Verifica loopback (127.0.0.0/8 ou ::1)
+            src_loop = src_ip_obj and src_ip_obj.is_loopback
+            dst_loop = dst_ip_obj and dst_ip_obj.is_loopback
+            
+            # Verifica link-local (169.254.0.0/16 ou fe80::/10)
+            src_link_local = src_ip_obj and src_ip_obj.is_link_local
+            dst_link_local = dst_ip_obj and dst_ip_obj.is_link_local
+            
+            if src_loop or dst_loop or src_link_local or dst_link_local:
+                logger.debug(f"Pacote loopback ou link-local descartado: {src_ip} -> {dst_ip}")
                 return False
         except ValueError:
             pass
@@ -151,7 +160,8 @@ class PacketProcessor:
             if proto:
                 try:
                     result['protocol_name'] = socket.getprotobynumber(proto).upper()
-                except (OSError, ValueError):
+                except (AttributeError, OSError):
+                    # Fallback manual se getprotobynumber não existir ou falhar
                     common_protos = {1: 'ICMP', 6: 'TCP', 17: 'UDP', 47: 'GRE', 50: 'ESP'}
                     result['protocol_name'] = common_protos.get(proto, f'Proto{proto}')
                 ip_layer = packet.getlayer(IP) or packet.getlayer(IPv6)
@@ -254,9 +264,10 @@ class FeatureExtractor:
 
 class PacketNormalizer:
     """Classe principal para normalizar pacotes."""
-    def __init__(self, filters: List[PacketFilter] = None, redis_client: Optional[RedisClient] = None):
+    def __init__(self, filters: List[PacketFilter] = None, redis_client: Optional[RedisClient] = None, rabbitmq_host: str = 'localhost'):
         self.processor = PacketProcessor()
         self.feature_extractor = FeatureExtractor(redis_client)
+        self.rabbitmq_host = rabbitmq_host  # Host do RabbitMQ, passado pelo IDSController
         self.filters = filters or [
             BroadcastFilter(),
             MulticastFilter(),
@@ -306,6 +317,21 @@ class PacketNormalizer:
 
             if not normalized['src_ip'] or not normalized['dst_ip']:
                 logger.warning(f"Pacote descartado por IP inválido: SRC={raw_result['src_ip']} DST={raw_result['dst_ip']}")
+                return None
+
+            # Ignorar pacotes envolvendo o host do RabbitMQ
+            src_ip = normalized.get('src_ip')
+            dst_ip = normalized.get('dst_ip')
+            if src_ip == self.rabbitmq_host or dst_ip == self.rabbitmq_host:
+                logger.debug(f"Pacote do/para RabbitMQ ignorado: {src_ip} -> {dst_ip}")
+                return None
+            
+            if normalized["protocol"] == 6 and all(flag == 0 for flag in normalized["tcp_flags"].values()):
+                logger.debug(f"Pacote TCP com flags zeradas descartado: {normalized['src_ip']} -> {normalized['dst_ip']}")
+                return None
+            
+            if normalized["payload_size"] == 0:
+                logger.debug(f"Pacote sem payload descartado: {normalized['src_ip']} -> {normalized['dst_ip']}")
                 return None
 
             # Aplicar filtros
