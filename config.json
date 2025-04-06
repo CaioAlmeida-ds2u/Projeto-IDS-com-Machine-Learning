@@ -1,57 +1,48 @@
 {
-    "blocker_worker": {
-      "check_interval_seconds": 5,
-      "firewall_type": "iptables"
-    },
-    "database": {
-      "host": "localhost",
-      "port": 3306,
-      "user": "ids_user",
-      "password": "fatec123",
-      "database": "ids_db",
-      "ssl": false,
-      "connect_timeout": 10,
-      "pool_size": 5
-    },
-    "ml_service": {
-      "anomaly_threshold": -0.15,
-      "model_path": "/caminho/completo/para/seu/modelo_ml.joblib"
-    },
-    "rabbitmq": {
-      "alert_queue": "ids_alert_notification_queue",
-      "host": "localhost",
-      "packet_queue": "ids_packet_analysis_queue",
-      "port": 5672
-    },
-    "redis": {
-      "block_list_key": "ids:blocked_ips",
-      "block_ttl_seconds": 3600,
-      "db": 0,
-      "host": "localhost",
-      "password": null,
-      "port": 6379
-    },
-    "service": {
-      "allowed_actions": [
-        "start",
-        "stop",
-        "status",
-        "get_config",
-        "shutdown"
-      ],
-      "last_modified": "2024-03-16T09:00:00Z",
-      "requested_command": "start",
-      "restart_command": "systemctl restart ids.service",
-      "start_command": "systemctl start ids.service",
-      "status": "running",
-      "stop_command": "systemctl stop ids.service"
-    },
-    "settings": {
-      "filter": "ip or ip6",
-      "interface": "enp0s3",
-      "log_level": "INFO",
-      "service_host": "localhost",
-      "service_port": 65432,
-      "noisy_ports": [137, 138, 139, 1900, 5353]
-    }
+  "blocker_worker": {
+    "check_interval_seconds": 5,
+    "firewall_type": "iptables"
+  },
+  "database": {
+    "host": "localhost",
+    "port": 3306,
+    "user": "ids_user",
+    "password": "fatec123",
+    "database": "ids_db"
+  },
+  "ml_service": {
+    "anomaly_threshold": -0.15,
+    "model_path": "/home/admin/ids_project/models/modelo_ml.joblib",
+    "feature_order": [
+      "payload_size", "src_port", "dst_port", "ttl", "udp_length", "is_tcp", "is_udp", "is_icmp",
+      "flag_syn", "flag_ack", "flag_fin", "flag_rst", "flag_psh", "flag_urg", "flag_ece", "flag_cwr",
+      "port_src_well_known", "port_dst_well_known", "port_dst_is_dns", "port_dst_is_ntp",
+      "port_dst_is_http", "port_dst_is_https", "same_network", "is_private"
+    ]
+  },
+  "rabbitmq": {
+    "alert_queue": "ids_alert_notification_queue",
+    "host": "localhost",
+    "packet_queue": "ids_packet_analysis_queue",
+    "port": 5672
+  },
+  "redis": {
+    "block_list_key": "ids:blocked_ips",
+    "block_ttl_seconds": 3600,
+    "db": 0,
+    "host": "localhost",
+    "password": null,
+    "port": 6379
+  },
+  "service": {
+    "allowed_actions": ["start", "stop", "status", "get_config", "shutdown"],
+    "status": "stopped"
+  },
+  "settings": {
+    "filter": "ip or ip6",
+    "interface": "enp0s3",
+    "log_level": "INFO",
+    "service_host": "localhost",
+    "service_port": 65432
   }
+}

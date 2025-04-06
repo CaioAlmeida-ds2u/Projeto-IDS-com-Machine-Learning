@@ -1,101 +1,191 @@
+# /home/admin/ids_project/packet_processor.py
+
 import scapy.all as scapy
 import threading
 import logging
 import time
-from typing import Callable, Optional, Dict, Any
+import os
+from typing import Callable, Optional, List
+from scapy.packet import Packet
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.inet6 import IPv6
+from queue import Queue
 
 logger = logging.getLogger(__name__)
 
 class PacketCapturer:
-    """Classe para captura de pacotes de rede."""
+    """Classe para captura de pacotes de rede em uma ou mais interfaces."""
 
-    def __init__(self, interface: str, packet_handler: Callable, filter_rules: str = "ip or ip6"):
-        self.interface = interface
+    def __init__(self, interfaces: List[str], packet_handler: Callable[[Packet], None], filter_rules: str = "ip or ip6", buffer_size: int = 1000):
+        """
+        Inicializa o capturador.
+
+        Args:
+            interfaces: Lista de interfaces de rede para captura.
+            packet_handler: Função para processar cada pacote capturado.
+            filter_rules: Regras de filtro para o Scapy (ex.: 'ip or ip6').
+            buffer_size: Tamanho máximo do buffer de pacotes.
+        """
+        self.interfaces = interfaces
         self.packet_handler = packet_handler
         self.filter_rules = filter_rules
+        self.buffer_size = buffer_size
         self.running = False
-        self.running_lock = threading.Lock()  # Adicionado lock
-        self.capture_thread = None
-    
-    def start(self) -> None:
-        """Inicia a captura em thread separada."""
+        self.running_lock = threading.Lock()
+        self.capture_threads: List[threading.Thread] = []
+        self.packet_queue = Queue(maxsize=buffer_size)
+        self.processor_thread: Optional[threading.Thread] = None
+
+    def start(self) -> bool:
+        """Inicia a captura em todas as interfaces especificadas."""
         with self.running_lock:
             if self.running:
-                logger.warning("Captura já está em execução")
-                return
+                logger.warning("Captura já está em execução.")
+                return False
 
-        # Valida se a interface existe
-        if not scapy.get_if_list() or self.interface not in scapy.get_if_list():
-            logger.error(f"Interface inválida ou não encontrada: {self.interface}")
-            return
+        # Valida interfaces e permissões
+        available_interfaces = scapy.get_if_list()
+        for iface in self.interfaces:
+            if iface not in available_interfaces:
+                logger.error(f"Interface inválida ou não encontrada: {iface}")
+                return False
+            if not self._check_permissions(iface):
+                logger.error(f"Permissões insuficientes para capturar em {iface}. Execute com privilégios.")
+                return False
 
         self.running = True
         try:
-            self.capture_thread = threading.Thread(
-                target=self._capture_loop,
-                name=f"PacketCapturer-{self.interface}",
+            # Inicia threads de captura para cada interface
+            for iface in self.interfaces:
+                thread = threading.Thread(
+                    target=self._capture_loop,
+                    args=(iface,),
+                    name=f"PacketCapturer-{iface}",
+                    daemon=True
+                )
+                self.capture_threads.append(thread)
+                thread.start()
+
+            # Inicia thread de processamento do buffer
+            self.processor_thread = threading.Thread(
+                target=self._process_buffer,
+                name="PacketProcessor",
                 daemon=True
             )
-            self.capture_thread.start()
-            logger.info(f"Captura iniciada na interface {self.interface} com filtro: {self.filter_rules}")
-        except Exception as e:
-            logger.error(f"Falha ao iniciar captura: {e}")
-            self.running = False
+            self.processor_thread.start()
 
-    def _capture_loop(self) -> None:
-        """Loop principal de captura."""
-        logger.debug("Entrando no _capture_loop")
+            logger.info(f"Captura iniciada em interfaces {self.interfaces} com filtro: {self.filter_rules}")
+            return True
+        except Exception as e:
+            logger.error(f"Falha ao iniciar captura: {e}", exc_info=True)
+            self.running = False
+            return False
+
+    def _check_permissions(self, interface: str) -> bool:
+        """Verifica se há permissões para capturar na interface."""
         try:
-            scapy.sniff(
-                iface=self.interface,
-                prn=self._handle_packet,
-                store=False,
-                stop_filter=lambda _: not self.running,
-                filter=self.filter_rules,
-                #timeout=60  Timeout de 60 segundos
-            )
-        except scapy.Scapy_Exception as e:
-            logger.error(f"Erro do Scapy: {e}")
+            # Testa captura mínima para verificar permissões
+            scapy.sniff(iface=interface, count=1, timeout=1, store=False)
+            return True
         except PermissionError:
-            logger.error("Permissão insuficiente. Execute com sudo.")
-        except Exception as e:
-            logger.error(f"Erro na captura: {e}")
-        finally:
-            self.running = False
-            logger.info("Captura encerrada")
+            return False
+        except Exception:
+            return True  # Assume OK se não for PermissionError
 
-    def _handle_packet(self, packet: scapy.packet.Packet) -> None:
+    def _capture_loop(self, interface: str) -> None:
+        """Loop de captura para uma interface específica."""
+        logger.debug(f"Iniciando captura em {interface}")
+        retry_count = 0
+        max_retries = 3
+        while self.running and retry_count < max_retries:
+            try:
+                scapy.sniff(
+                    iface=interface,
+                    prn=lambda pkt: self.packet_queue.put(pkt),
+                    store=False,
+                    stop_filter=lambda _: not self.running,
+                    filter=self.filter_rules,
+                    timeout=60  # Reinicia após 60s se não houver pacotes
+                )
+                retry_count = 0  # Reseta retries após sucesso
+            except PermissionError:
+                logger.error(f"Permissão insuficiente em {interface}. Encerrando captura.")
+                break
+            except scapy.Scapy_Exception as e:
+                logger.error(f"Erro do Scapy em {interface}: {e}")
+                retry_count += 1
+                time.sleep(5 * retry_count)  # Backoff
+            except Exception as e:
+                logger.error(f"Erro inesperado em {interface}: {e}", exc_info=True)
+                retry_count += 1
+                time.sleep(5 * retry_count)
+        self.running = False
+        logger.info(f"Captura em {interface} encerrada.")
+
+    def _process_buffer(self) -> None:
+        """Processa pacotes do buffer em uma thread separada."""
+        while self.running or not self.packet_queue.empty():
+            try:
+                packet = self.packet_queue.get(timeout=1)
+                self._handle_packet(packet)
+                self.packet_queue.task_done()
+            except Queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Erro ao processar pacote do buffer: {e}", exc_info=True)
+
+    def _handle_packet(self, packet: Packet) -> None:
         """Processa cada pacote capturado."""
         try:
-            if UDP in packet:
-                logger.debug(f"Pacote UDP capturado: {packet.summary()} | Origem: {packet[IP].src} -> Destino: {packet[IP].dst}")
-            elif TCP in packet:
-                logger.debug(f"Pacote TCP capturado: {packet.summary()} | Origem: {packet[IP].src} -> Destino: {packet[IP].dst}")
-            elif ICMP in packet:
-                logger.debug(f"Pacote ICMP capturado: {packet.summary()} | Origem: {packet[IP].src} -> Destino: {packet[IP].dst}")
-            elif IPv6 in packet:
-                logger.debug(f"Pacote IPv6 capturado: {packet.summary()} | Origem: {packet[IPv6].src} -> Destino: {packet[IPv6].dst}")
-            else:
-                logger.debug(f"Pacote IP capturado: {packet.summary()}")
+            # Logging reduzido para performance; habilitar apenas em debug
+            if logger.isEnabledFor(logging.DEBUG):
+                if UDP in packet:
+                    logger.debug(f"UDP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
+                elif TCP in packet:
+                    logger.debug(f"TCP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
+                elif ICMP in packet:
+                    logger.debug(f"ICMP: {packet.summary()} | {packet[IP].src} -> {packet[IP].dst}")
+                elif IPv6 in packet:
+                    logger.debug(f"IPv6: {packet.summary()} | {packet[IPv6].src} -> {packet[IPv6].dst}")
+                else:
+                    logger.debug(f"Outro: {packet.summary()}")
             self.packet_handler(packet)
         except Exception as e:
-            logger.error(f"Erro no processamento do pacote: {e}", exc_info=True)
-
+            logger.error(f"Erro ao processar pacote: {e}", exc_info=True)
 
     def stop(self) -> None:
-        """Para a captura."""
-        if self.running:
+        """Para a captura em todas as interfaces."""
+        with self.running_lock:
+            if not self.running:
+                logger.info("Captura já estava parada.")
+                return
             self.running = False
-            if self.capture_thread:
-                self.capture_thread.join(timeout=5)
-                if self.capture_thread.is_alive():
-                    logger.warning("A thread de captura não foi encerrada dentro do tempo limite")
-                else:
-                    logger.info("Captura finalizada com sucesso")
+
+        for thread in self.capture_threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    logger.warning(f"Thread de captura {thread.name} não encerrou a tempo.")
+        if self.processor_thread and self.processor_thread.is_alive():
+            self.processor_thread.join(timeout=5)
+            if self.processor_thread.is_alive():
+                logger.warning("Thread de processamento não encerrou a tempo.")
+        self.capture_threads.clear()
+        self.processor_thread = None
+        logger.info("Captura finalizada.")
 
     def is_alive(self) -> bool:
-        """Verifica se a thread de captura está ativa."""
-        return self.capture_thread.is_alive() if self.capture_thread else False
+        """Verifica se alguma thread de captura está ativa."""
+        return any(t.is_alive() for t in self.capture_threads) if self.capture_threads else False
+
+# Teste standalone
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s [%(levelname)s] - %(message)s')
+    def dummy_handler(pkt):
+        print(f"Pacote capturado: {pkt.summary()}")
+
+    capturer = PacketCapturer(interfaces=["lo"], packet_handler=dummy_handler)
+    capturer.start()
+    time.sleep(10)
+    capturer.stop()
