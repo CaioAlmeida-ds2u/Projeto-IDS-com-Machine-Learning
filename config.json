@@ -21,10 +21,10 @@
     ]
   },
   "rabbitmq": {
-    "alert_queue": "ids_alert_notification_queue",
     "host": "localhost",
-    "packet_queue": "ids_packet_analysis_queue",
-    "port": 5672
+    "port": 5672,
+    "queue": "pacotes",
+    "alert_queue": "ids_alert_notification_queue"
   },
   "redis": {
     "block_list_key": "ids:blocked_ips",

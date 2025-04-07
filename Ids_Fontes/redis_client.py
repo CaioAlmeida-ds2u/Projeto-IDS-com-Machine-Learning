@@ -1,5 +1,3 @@
-# /home/admin/ids_project/redis_client.py
-
 import redis
 import logging
 from typing import Optional, Set, Union
@@ -78,6 +76,37 @@ class RedisClient:
         self._connect()
         return self.connection
 
+    def incr_with_expiry(self, key: str, expiry: int) -> int:
+        """Incrementa uma chave e define TTL atomicamente, retornando o novo valor."""
+        conn = self.get_connection()
+        if not conn:
+            logger.warning(f"incr_with_expiry: Sem conexão para chave {key}. Retornando 0.")
+            return 0
+        try:
+            pipe = conn.pipeline()
+            pipe.incr(key)
+            pipe.expire(key, expiry)
+            results = pipe.execute()
+            count = int(results[0])  # Valor após incremento
+            logger.debug(f"Chave {key} incrementada para {count} com TTL {expiry}s")
+            return count
+        except RedisError as e:
+            logger.error(f"Erro ao incrementar chave {key}: {type(e).__name__}: {str(e)}")
+            return 0
+
+    def get(self, key: str) -> Optional[int]:
+        """Obtém o valor de uma chave, retornando 0 se não existir ou em caso de erro."""
+        conn = self.get_connection()
+        if not conn:
+            logger.warning(f"get: Sem conexão para chave {key}. Retornando 0.")
+            return 0
+        try:
+            value = conn.get(key)
+            return int(value) if value is not None else 0
+        except RedisError as e:
+            logger.error(f"Erro ao obter chave {key}: {type(e).__name__}: {str(e)}")
+            return 0
+
     def is_blocked(self, ip_address: str) -> bool:
         """Verifica se um IP está bloqueado."""
         conn = self.get_connection()
@@ -147,32 +176,11 @@ class RedisClient:
 
     def increment_packet_count(self, ip_address: str, ttl: int = 5) -> int:
         """Incrementa e retorna a contagem de pacotes por IP em uma janela de tempo."""
-        conn = self.get_connection()
-        if not conn:
-            logger.warning(f"increment_packet_count: Sem conexão para {ip_address}. Retornando 0.")
-            return 0
-        key = f"rate:{ip_address}"
-        try:
-            count = conn.incr(key)
-            conn.expire(key, ttl)
-            return count
-        except RedisError as e:
-            logger.error(f"Erro ao contar pacotes para {ip_address}: {e}")
-            return 0
+        return self.incr_with_expiry(f"rate:{ip_address}", ttl)
 
     def get_packet_rate(self, ip_address: str) -> int:
         """Retorna a taxa de pacotes atual para um IP."""
-        conn = self.get_connection()
-        if not conn:
-            logger.warning(f"get_packet_rate: Sem conexão para {ip_address}.")
-            return 0
-        key = f"rate:{ip_address}"
-        try:
-            count = conn.get(key)
-            return int(count) if count else 0
-        except RedisError as e:
-            logger.error(f"Erro ao obter taxa para {ip_address}: {e}")
-            return 0
+        return self.get(f"rate:{ip_address}")
 
     def close(self) -> None:
         """Fecha a conexão com o Redis."""
@@ -194,22 +202,24 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     client = RedisClient(host='localhost', port=6379, block_ttl_seconds=60)
 
-    # Limpar chave de teste
+    # Limpar chaves de teste
     conn = client.get_connection()
     if conn:
-        conn.delete('ids:blocked_ips')
+        conn.delete('ids:blocked_ips', 'ssh_attempts:192.168.1.1')
 
-    # Testes
+    # Teste de bloqueio
     print("Adicionando IPs...")
     client.add_block("192.168.1.1")
-    client.add_block("10.0.0.1", ttl=10)
     print(f"192.168.1.1 bloqueado? {client.is_blocked('192.168.1.1')}")
     print(f"Lista de bloqueados: {client.get_blocked_ips()}")
 
-    print("Contando pacotes...")
-    for _ in range(5):
-        print(f"Taxa para 192.168.1.1: {client.increment_packet_count('192.168.1.1')}")
+    # Teste de contagem SSH
+    print("Simulando tentativas SSH...")
+    for i in range(5):
+        count = client.incr_with_expiry("ssh_attempts:192.168.1.1", 5)
+        print(f"Tentativa {i+1}: {count}")
     
+    print(f"Valor atual: {client.get('ssh_attempts:192.168.1.1')}")
     client.remove_block("192.168.1.1")
     print(f"Após remoção: {client.get_blocked_ips()}")
     client.close()

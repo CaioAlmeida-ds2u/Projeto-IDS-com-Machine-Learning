@@ -12,8 +12,7 @@ import scapy.all as scapy
 # Importando Classes dos fontes config.py, packet_processor.py e data_processing.py
 from config import ConfigManager
 from packet_processor import PacketCapturer
-from data_processing import PacketNormalizer ,NoisyPortFilter, BroadcastFilter
-from redis_client import RedisClient
+from data_processing import PacketNormalizer
 from systemd.journal import JournalHandler
 
 logger = logging.getLogger(__name__)
@@ -288,24 +287,26 @@ class IDSController:
         """Normaliza o pacote e envia para o RabbitMQ."""
         try:
             processed = self.normalizer.normalize(packet)  # Usa a instância
-            if processed: # Verifica se o pacote foi processado corretamente
+            if processed:  # Verifica se o pacote foi processado corretamente
                 # Adiciona validação de IPs
                 if not self._validate_ip(processed.get('src_ip')) or not self._validate_ip(processed.get('dst_ip')):
                     logger.warning("IP inválido detectado.", extra=processed) 
                     return
-                logger.debug("Packet processed", extra=processed) # Adiciona log de depuração
+                logger.debug("Pacote processado", extra=processed)  # Adiciona log de depuração
                 if not self.rabbitmq_channel or not self.rabbitmq_channel.is_open:
-                    self._connect_to_rabbitmq() # Tenta reconectar ao RabbitMQ
+                    logger.warning("Canal RabbitMQ não está aberto. Tentando reconectar...")
+                    self._connect_to_rabbitmq()
                     if not self.rabbitmq_channel or not self.rabbitmq_channel.is_open:
                         logger.error("Falha ao reconectar ao RabbitMQ. Mensagem perdida.")
                         return
-                message_body = json.dumps(processed) # Serializa o pacote processado
+                message_body = json.dumps(processed)  # Serializa o pacote processado
                 self.rabbitmq_channel.basic_publish(
                     exchange='',
                     routing_key=self.rabbitmq_queue,
                     body=message_body,
-                    properties=pika.BasicProperties(delivery_mode=2)
-                ) # Mensagem persistente
+                    properties=pika.BasicProperties(delivery_mode=2)  # Mensagem persistente
+                )
+                logger.debug(f"Mensagem enviada para a fila '{self.rabbitmq_queue}': {message_body}")
         except Exception as e:
             logger.error(f"Erro ao processar pacote: {e}", exc_info=True)
 
